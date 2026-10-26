@@ -130,11 +130,11 @@ The [workflow](.github/workflows/release.yml) builds the exe on GitHub's Windows
 the audio tests on every push. To publish a release, push a tag:
 
 ```sh
-git tag v1.5.14-audio.3
-git push origin v1.5.14-audio.3
+git tag v1.5.14-audio.4
+git push origin v1.5.14-audio.4
 ```
 
-GitHub then attaches `Beamer-v1.5.14-audio.3.exe` to a new release.
+GitHub then attaches `Beamer-v1.5.14-audio.4.exe` to a new release.
 
 ## Quick start
 

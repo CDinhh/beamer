@@ -139,6 +139,11 @@ class LoopbackCapture:
         self._error = None
         self._thread = threading.Thread(target=self._run, name="beamer-loopback", daemon=True)
 
+    @property
+    def thread(self):
+        """The capturing thread, so a caller can tell if it stopped by itself."""
+        return self._thread
+
     def start(self) -> None:
         self._thread.start()
         self._ready.wait(10)

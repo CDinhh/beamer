@@ -275,6 +275,7 @@ class AudioShare:
         self._receiving = False
         self._applied = {side: None for side in self.SIDES}
         self._teardowns = {side: _nothing for side in self.SIDES}
+        self._workers = {}  # side -> the thread that does its work, to notice one that died
 
     @property
     def status(self) -> str:
@@ -333,9 +334,13 @@ class AudioShare:
 
     def _apply_side(self, side: str, wanted: tuple, peers: list) -> None:
         if wanted == self._applied[side]:
-            return
+            worker = self._workers.get(side)
+            if worker is None or worker.is_alive():
+                return
+            LOGGER.warning("Audio %s stopped by itself; starting it again", side)
         self._teardowns[side]()
         self._teardowns[side] = _nothing
+        self._workers.pop(side, None)
         self._applied[side] = wanted
         status = ""
         kind = wanted[0]
@@ -369,6 +374,8 @@ class AudioShare:
         try:
             if capture is not None:
                 capture.start()
+                if getattr(capture, "thread", None) is not None:
+                    self._workers["send"] = capture.thread
                 return lambda: (capture.stop(), sock.close())
         except Exception as error:
             LOGGER.warning("Could not leave Beamer's own sound out of the stream: %s", error)
@@ -411,71 +418,106 @@ class AudioShare:
 
     def _start_receiving(self, peers: list):
         accepted = {audio_key_id(p["token"]): p for p in peers}
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.bind(("", PORT))
-        except OSError:
-            sock.close()
-            raise
-        sock.settimeout(0.5)
+
+        def bind():
+            fresh = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                fresh.bind(("", PORT))
+            except OSError:
+                fresh.close()
+                raise
+            fresh.settimeout(0.5)
+            return fresh
+
+        holder = [bind()]
         stop = threading.Event()
         pa = _pyaudio()
         self.sources = {p["id"]: {"name": p["name"], "playing": False, "level": 0.0} for p in peers}
+
+        def take(heard, datagram, now):
+            peer = accepted.get(datagram[:KEY_ID_SIZE])
+            opened = unseal(peer["token"], datagram) if peer else None
+            if opened is None:
+                return
+            session, sequence, rate, pcm = opened
+            source = heard.setdefault(peer["id"], _Source(peer["id"], peer["name"]))
+            try:
+                if source.player is not None and source.session == session and sequence <= source.sequence:
+                    return  # a repeat or a late datagram
+                if source.player is None or source.player.rate != rate:
+                    if source.player is not None:
+                        source.player.close()
+                        source.player = None
+                    source.player = Player(pa, rate)
+                    LOGGER.info("Playing sound from %s at %d Hz", peer["name"], rate)
+                source.session, source.sequence, source.heard = session, sequence, now
+                source.level = peak(pcm)
+                percent = self.volumes.get(peer["id"], DEFAULT_VOLUME)
+                if percent:
+                    source.player.feed(scaled(pcm, percent))
+            except Exception as error:
+                # This source is dropped and tried again on its next datagram; the others play on.
+                LOGGER.exception("Could not play the sound from %s", peer["name"])
+                self.receive_status = "Could not play sound: " + (str(error) or error.__class__.__name__)
+                player, source.player = source.player, None
+                try:
+                    if player is not None:
+                        player.close()
+                except Exception:
+                    pass
+                return
+            self._publish(heard)
 
         def listen():
             heard = {}  # peer id -> _Source
             try:
                 while not stop.is_set():
                     try:
-                        datagram = sock.recv(MAX_DATAGRAM)
+                        datagram = holder[0].recv(MAX_DATAGRAM)
                     except socket.timeout:
                         datagram = None
                     except OSError as error:
-                        if stop.is_set() or getattr(error, "winerror", 0) not in (10040, 10054):
+                        if stop.is_set():
                             break
+                        if getattr(error, "winerror", 0) not in (10040, 10054):
+                            # The network changed under the socket: listen again on a fresh one.
+                            LOGGER.warning("Audio receive error %s; listening again", error)
+                            try:
+                                holder[0].close()
+                                holder[0] = bind()
+                            except OSError:
+                                stop.wait(1.0)
                         continue  # an oversize datagram or an ICMP reset: drop it, keep listening
                     now = time.monotonic()
                     for source in list(heard.values()):
                         if now - source.heard > IDLE_SECONDS and source.player is not None:
-                            source.player.close()
+                            try:
+                                source.player.close()
+                            except Exception:
+                                LOGGER.exception("Could not close the sound of %s", source.name)
                             source.player = None
                             source.level = 0.0
                             self._publish(heard)
-                    if datagram is None:
-                        continue
-                    peer = accepted.get(datagram[:KEY_ID_SIZE])
-                    opened = unseal(peer["token"], datagram) if peer else None
-                    if opened is None:
-                        continue
-                    session, sequence, rate, pcm = opened
-                    source = heard.setdefault(peer["id"], _Source(peer["id"], peer["name"]))
-                    if source.player is not None and source.session == session and sequence <= source.sequence:
-                        continue  # a repeat or a late datagram
-                    if source.player is None or source.player.rate != rate:
-                        if source.player is not None:
-                            source.player.close()
-                            source.player = None
-                        source.player = Player(pa, rate)
-                    source.session, source.sequence, source.heard = session, sequence, now
-                    source.level = peak(pcm)
-                    percent = self.volumes.get(peer["id"], DEFAULT_VOLUME)
-                    if percent:
-                        source.player.feed(scaled(pcm, percent))
-                    self._publish(heard)
+                    if datagram is not None:
+                        take(heard, datagram, now)
             except Exception as error:
-                LOGGER.exception("Audio playback failed")
+                LOGGER.exception("Audio listening stopped")
                 self.receive_status = "Could not play sound: " + (str(error) or error.__class__.__name__)
             finally:
                 for source in heard.values():
                     if source.player is not None:
-                        source.player.close()
+                        try:
+                            source.player.close()
+                        except Exception:
+                            pass
 
         worker = threading.Thread(target=listen, name="beamer-audio-in", daemon=True)
         worker.start()
+        self._workers["receive"] = worker
 
         def teardown():
             stop.set()
-            sock.close()
+            holder[0].close()
             worker.join(3)
             self.sources = {}
 

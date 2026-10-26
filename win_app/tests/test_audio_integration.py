@@ -7,6 +7,7 @@ import socket
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from array import array
@@ -458,6 +459,55 @@ class ReceiveTests(ShareCase):
         self.listen()
         self.sock.sendto(b"X" * 5000, ("127.0.0.1", audio_share.PORT))
         time.sleep(0.05)
+        self.send(TOKEN_A, pcm_of(1000))
+        wait_until(lambda: self.share.receive_status == "Playing from Laptop")
+
+    def test_an_unexpected_socket_error_makes_it_listen_again_instead_of_stopping(self):
+        self.listen()
+        real_recv = socket.socket.recv
+        failed = []
+
+        def recv(sock, size, *args):
+            if not failed:
+                failed.append(True)
+                raise OSError(10052, "network reset")
+            return real_recv(sock, size, *args)
+
+        with patch("socket.socket.recv", recv):
+            wait_until(lambda: failed)
+            time.sleep(0.2)
+        self.send(TOKEN_A, pcm_of(1000))
+        wait_until(lambda: self.share.receive_status == "Playing from Laptop")
+        self.assertTrue(self.share._workers["receive"].is_alive())
+
+    def test_one_bad_datagram_or_source_does_not_end_the_listener(self):
+        self.listen()
+        real_feed = audio_share.Player.feed
+        calls = []
+
+        def feed(player, pcm):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("device vanished")
+            return real_feed(player, pcm)
+
+        with patch.object(audio_share.Player, "feed", feed):
+            self.send(TOKEN_A, pcm_of(1000))
+            wait_until(lambda: self.share.receive_status.startswith("Could not play sound"))
+            self.send(TOKEN_A, pcm_of(1000))
+            wait_until(lambda: self.share.receive_status == "Playing from Laptop")
+        self.assertTrue(self.share._workers["receive"].is_alive())
+
+    def test_a_listener_that_died_is_started_again_by_the_manager(self):
+        self.listen()
+        first = self.share._workers["receive"]
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join()
+        self.share._workers["receive"] = dead
+        self.share.apply()
+        wait_until(lambda: self.share._workers["receive"] is not dead)
+        self.assertIsNot(self.share._workers["receive"], first)
         self.send(TOKEN_A, pcm_of(1000))
         wait_until(lambda: self.share.receive_status == "Playing from Laptop")
 
