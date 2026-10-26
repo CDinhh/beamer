@@ -65,6 +65,73 @@ The downloadable `Beamer-<version>-x86_64.flatpak` bundle remains available from
 page](https://github.com/kalkman-code/beamer/releases/latest) as an offline alternative. To build
 for arm64, follow [the Linux instructions](docs/flatpak-build.md).
 
+## This fork: Windows audio sharing
+
+This fork ([CDinhh/beamer](https://github.com/CDinhh/beamer)) adds **audio sharing between Windows
+PCs** on top of Beamer's keyboard and mouse sharing. One PC sends what its speakers play, another
+plays it, and both can do both at once. Mac and Linux are unchanged.
+
+### Install it (Windows 10 and 11)
+
+1. **Download.** Get `Beamer-<version>.exe` from this fork's
+   [Releases](https://github.com/CDinhh/beamer/releases/latest). It is a single program: no installer
+   and no other software.
+2. **Put it somewhere permanent**, for example `C:\Program Files\Beamer` or a folder in your
+   user profile, and make a shortcut to it. Windows may say "Windows protected your PC": choose
+   More info, then Run anyway. The file is not code-signed.
+3. **Run it on both PCs**, then pair them as in [Quick start](#quick-start).
+4. The first time a PC receives sound, Windows asks to allow Beamer through the firewall. Allow it on
+   your private network.
+
+Already using Beamer? Quit it from the tray icon and replace `Beamer.exe` with the new file. Your
+pairing and settings are kept.
+
+### Use it
+
+Open Beamer, then the **Audio** page.
+
+- **Send this PC's sound.** Turn it on, choose the PC to send to and which sound to send. *Default
+  speakers* sends everything this PC plays. Turn on *Mute this PC's speakers while sending* to make
+  only the other PC play it.
+- **Play another PC's sound here.** Turn it on, choose which PC to hear and which speakers to play on.
+- **Both ways at once** works, as long as a PC does not play on the device it is sending, or the
+  sound loops back. Beamer refuses that and says so on the page.
+
+Sound goes straight between the two PCs on UDP port 24822, sealed with a key derived from their
+pairing, so only a paired PC is heard. A PC that is not paired cannot play sound on yours.
+
+Limits: Windows to Windows only; surround sound is reduced to its front pair; Beamer cannot add a
+new speaker to Windows' output list (that needs a signed driver), so you turn sending on in Beamer
+instead of choosing an output in Windows.
+
+### Build it yourself
+
+You need [Git](https://git-scm.com) and [Python 3.12](https://www.python.org/downloads/) (tick
+*Add python.exe to PATH*). In PowerShell:
+
+```powershell
+git clone -b audio-sharing https://github.com/CDinhh/beamer.git
+cd beamer\win_app
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements-win.txt
+.\.venv\Scripts\python -m PyInstaller --clean --noconfirm --distpath dist --workpath build build.spec
+```
+
+`win_app\dist\Beamer.exe` is the program. To run from source without building, finish with
+`.\.venv\Scripts\python kvm_bridge_win.py` instead.
+
+### Releases
+
+The [workflow](.github/workflows/release.yml) builds the exe on GitHub's Windows machines and runs
+the audio tests on every push. To publish a release, push a tag:
+
+```sh
+git tag v1.5.14-audio.1
+git push origin v1.5.14-audio.1
+```
+
+GitHub then attaches `Beamer-v1.5.14-audio.1.exe` to a new release.
+
 ## Quick start
 
 1. **Install on every machine.** On the Mac, drag Beamer to Applications, open it, and press the
@@ -121,6 +188,9 @@ In your own appearance: light if your GitHub is light, dark if it is dark.
   Alt, so Cmd+C copies there too. The PC gets the reverse. Between two Macs or two PCs, each key
   arrives as the same physical key. On Windows, you can also choose a Mac keyboard layout, where
   Alt acts as Command and the Windows key acts as Option.
+- **Sound follows you (this fork, Windows).** Send one PC's sound to another PC's speakers, or play
+  another PC's sound here, both ways at once, from the Audio page. See
+  [This fork](#this-fork-windows-audio-sharing).
 - **Media keys follow you.** Play, pause, skip, mute and volume cross between supported machines.
   Brightness and keyboard-backlight keys stay on the Mac.
 - **Keys and buttons that stay put.** Each machine keeps a list of keys and mouse buttons that keep
