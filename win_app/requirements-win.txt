@@ -2,7 +2,7 @@ PySide6-Essentials>=6.11.1
 pyinstaller>=6.0
 pyinstaller-hooks-contrib>=2024.1
 PyNaCl>=1.6
-PyAudioWPatch>=0.2.12.14; sys_platform == "win32"
+PyAudioWPatch>=0.2.12.6; sys_platform == "win32"
 pywin32>=306
 segno>=1.6
 pycaw>=20240210; sys_platform == "win32"
