@@ -26,6 +26,7 @@ from nacl.exceptions import CryptoError
 from nacl.secret import SecretBox
 from nacl.utils import random as random_bytes
 
+import audio_mute
 from core import protocol
 
 LOGGER = logging.getLogger("beamer.audio")
@@ -108,15 +109,16 @@ def load_audio(settings_path) -> dict:
         "mode": mode if mode in MODES else "off",
         "peer": raw["peer"] if isinstance(raw.get("peer"), str) else "",
         "output": raw["output"] if isinstance(raw.get("output"), str) else "",
+        "mute_local": raw.get("mute_local") is True,
     }
 
 
-def save_audio(settings_path, mode: str, peer: str = "", output: str = "") -> None:
+def save_audio(settings_path, mode: str, peer: str = "", output: str = "", mute_local: bool = False) -> None:
     if mode not in MODES:
         raise ValueError(mode)
     target = settings_dir(settings_path) / FILE_NAME
     temporary = target.with_name(FILE_NAME + ".tmp")
-    temporary.write_text(json.dumps({"mode": mode, "peer": peer, "output": output}), encoding="utf-8")
+    temporary.write_text(json.dumps({"mode": mode, "peer": peer, "output": output, "mute_local": bool(mute_local)}), encoding="utf-8")
     os.replace(temporary, target)
 
 
@@ -275,7 +277,7 @@ class AudioShare:
         peers = paired_peers(self.settings_path)
         if choice["mode"] == "send":
             target = next((p for p in peers if p["id"] == choice["peer"] and p["host"]), None)
-            wanted = ("send", target["host"], target["token"]) if target else ("send-missing",)
+            wanted = ("send", target["host"], target["token"], choice["mute_local"]) if target else ("send-missing",)
         elif choice["mode"] == "receive":
             wanted = ("receive", choice["peer"], choice["output"], tuple((p["id"], p["token"]) for p in peers))
         else:
@@ -290,13 +292,13 @@ class AudioShare:
         elif wanted[0] == "send-missing":
             self.status = "Choose a paired machine to send to"
         elif wanted[0] == "send":
-            self._teardown = self._start_sending(wanted[1], wanted[2])
+            self._teardown = self._start_sending(wanted[1], wanted[2], wanted[3])
             self.status = "Sending this PC's sound"
         else:
             self._teardown = self._start_receiving(choice["peer"], choice["output"], peers)
             self.status = "Waiting for sound"
 
-    def _start_sending(self, host: str, token: str):
+    def _start_sending(self, host: str, token: str, mute_local: bool = False):
         pa = _pyaudio()
         player = pa.PyAudio()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -322,11 +324,21 @@ class AudioShare:
             player.terminate()
             raise
 
+        muter = None
+        if mute_local:
+            muter = audio_mute.SpeakerMute()
+            if not muter.mute():
+                LOGGER.warning("Could not mute this PC's speakers; they keep playing while sending")
+
         def teardown():
-            stream.stop_stream()
-            stream.close()
-            player.terminate()
-            sock.close()
+            try:
+                stream.stop_stream()
+                stream.close()
+                player.terminate()
+                sock.close()
+            finally:
+                if muter is not None:
+                    muter.restore()
 
         return teardown
 
@@ -354,8 +366,10 @@ class AudioShare:
                             player = source = None
                             self.status = "Waiting for sound"
                         continue
-                    except OSError:
-                        break
+                    except OSError as error:
+                        if stop.is_set() or getattr(error, "winerror", 0) not in (10040, 10054):
+                            break
+                        continue  # an oversize datagram or an ICMP reset: drop it, keep listening
                     peer = accepted.get(datagram[:KEY_ID_SIZE])
                     opened = unseal(peer["token"], datagram) if peer else None
                     if opened is None:
@@ -371,7 +385,7 @@ class AudioShare:
                             player.close()
                             player = None
                         player = Player(pa, rate, output)
-                        self.status = "Playing sound from " + peer["name"]
+                    self.status = "Playing sound from " + peer["name"]
                     source = (peer["id"], session, sequence, now)
                     player.feed(pcm)
             except Exception as error:

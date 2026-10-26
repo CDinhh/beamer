@@ -5130,7 +5130,7 @@ class WindowsApplication(QWidget):
 
     def start(self) -> None:
         self.update_checker.start()
-        if self.audio is not None:
+        if getattr(self, "audio", None) is not None:
             self.audio.start()
         self._listen()
 
@@ -5455,7 +5455,7 @@ class WindowsApplication(QWidget):
         if self._closing:
             return
         self._closing = True
-        if self.audio is not None:
+        if getattr(self, "audio", None) is not None:
             self.audio.stop()
         self.identify_screens.stop()
         self.refresh_timer.stop()

@@ -1,7 +1,7 @@
 """The Audio sharing window: send this PC's sound to another PC, or play another PC's sound here."""
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QLabel, QRadioButton, QVBoxLayout
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QLabel, QRadioButton, QVBoxLayout
 
 import audio_share
 from core.i18n import tr
@@ -27,6 +27,8 @@ class AudioDialog(QDialog):
         self.source.addItem(tr("Any paired PC"), "")
         for peer in self.peers:
             self.source.addItem(peer["name"], peer["id"])
+        self.mute = QCheckBox(tr("Mute this PC's speakers while sending"))
+        self.mute.setChecked(saved["mute_local"])
         self.output = QComboBox()
         self.output.addItem(tr("Default speakers"), "")
         try:
@@ -41,14 +43,15 @@ class AudioDialog(QDialog):
         layout.addWidget(self.off)
         layout.addWidget(self.send)
         layout.addWidget(self.target)
+        layout.addWidget(self.mute)
         layout.addWidget(self.receive)
         layout.addWidget(QLabel(tr("Play sound from")))
         layout.addWidget(self.source)
         layout.addWidget(QLabel(tr("Play on")))
         layout.addWidget(self.output)
         note = QLabel(tr(
-            "Both PCs need Beamer with audio sharing, paired, and this PC keeps playing its own sound "
-            "too: lower or mute it here if you only want to hear the other PC. A PC either sends or plays, never both."))
+            "Both PCs need Beamer with audio sharing and must be paired. Without the tick above, this PC keeps "
+            "playing its own sound too. A PC either sends or plays, never both."))
         note.setWordWrap(True)
         layout.addWidget(note)
         self.status = QLabel("")
@@ -75,12 +78,14 @@ class AudioDialog(QDialog):
 
     def _enable(self) -> None:
         self.target.setEnabled(self.send.isChecked() and bool(self.peers))
+        self.mute.setEnabled(self.send.isChecked())
         self.source.setEnabled(self.receive.isChecked())
         self.output.setEnabled(self.receive.isChecked())
 
     def _save(self) -> None:
         if self.send.isChecked():
-            audio_share.save_audio(self.share.settings_path, "send", self.target.currentData() or "")
+            audio_share.save_audio(
+                self.share.settings_path, "send", self.target.currentData() or "", mute_local=self.mute.isChecked())
         elif self.receive.isChecked():
             audio_share.save_audio(
                 self.share.settings_path, "receive", self.source.currentData() or "", self.output.currentData() or "")

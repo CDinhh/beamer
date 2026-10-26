@@ -59,7 +59,7 @@ class FileTests(unittest.TestCase):
 
     def test_a_saved_choice_comes_back(self):
         audio_share.save_audio(self.settings, "receive", "abc", "Speakers")
-        self.assertEqual(audio_share.load_audio(self.settings), {"mode": "receive", "peer": "abc", "output": "Speakers"})
+        self.assertEqual(audio_share.load_audio(self.settings), {"mode": "receive", "peer": "abc", "output": "Speakers", "mute_local": False})
         with self.assertRaises(ValueError):
             audio_share.save_audio(self.settings, "both")
 
