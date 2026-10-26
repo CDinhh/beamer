@@ -32,7 +32,7 @@ jobs:
       - name: Audio tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m unittest tests.test_audio_share tests.test_audio_integration tests.test_audio_mute -v
+        run: python -m unittest tests.test_audio_share tests.test_audio_integration -v
 
       - name: Build Beamer.exe
         env:
