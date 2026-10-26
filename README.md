@@ -68,8 +68,8 @@ for arm64, follow [the Linux instructions](docs/flatpak-build.md).
 ## This fork: Windows audio sharing
 
 This fork ([CDinhh/beamer](https://github.com/CDinhh/beamer)) adds **audio sharing between Windows
-PCs** on top of Beamer's keyboard and mouse sharing. One PC sends what its speakers play, another
-plays it, and both can do both at once. Mac and Linux are unchanged.
+PCs** on top of Beamer's keyboard and mouse sharing. Each PC can stream what it plays to the others and
+hear theirs, mixed together. Mac and Linux are unchanged.
 
 ### Install it (Windows 10 and 11)
 
@@ -88,21 +88,25 @@ pairing and settings are kept.
 
 ### Use it
 
-Open Beamer, then the **Audio** page.
+Open Beamer, then the **Audio** page. Each PC has two switches:
 
-- **Send this PC's sound.** Turn it on, choose the PC to send to and which sound to send. *Default
-  speakers* sends everything this PC plays. Turn on *Mute this PC's speakers while sending* to make
-  only the other PC play it.
-- **Play another PC's sound here.** Turn it on, choose which PC to hear and which speakers to play on.
-- **Both ways at once** works, as long as a PC does not play on the device it is sending, or the
-  sound loops back. Beamer refuses that and says so on the page.
+- **Stream this PC's sound.** Everything this PC plays goes to every paired Windows PC that is hearing.
+  Beamer's own sound is left out, so what a PC plays for others never travels back to them.
+- **Hear the other PCs.** Beamer plays what the other PCs stream, itself, on this PC's speakers. With
+  three PCs streaming you hear all three mixed.
 
-Sound goes straight between the two PCs on UDP port 24822, sealed with a key derived from their
-pairing, so only a paired PC is heard. A PC that is not paired cannot play sound on yours.
+Under the switches there is a card for each paired PC with a live level, a **Mute** button and its own
+**volume** (0 to 150%), so you can turn one PC down without touching the others. Nothing to choose
+about where sound goes: it is Beamer that plays it.
 
-Limits: Windows to Windows only; surround sound is reduced to its front pair; Beamer cannot add a
-new speaker to Windows' output list (that needs a signed driver), so you turn sending on in Beamer
-instead of choosing an output in Windows.
+Sound goes straight between the PCs on UDP port 24822, sealed with a key derived from their pairing,
+so only a paired PC is heard. Streaming and hearing are separate, so a PC can stream without hearing
+anyone, or hear without streaming.
+
+Limits: Windows 10 (2004 or later) and 11, Windows to Windows only. Streaming leaves Beamer's own sound
+out using a Windows feature that older versions lack; there, a PC can stream or hear, not both.
+Surround sound is reduced to stereo. Beamer plays on the PC's default speakers and cannot add a new
+speaker to Windows' output list (that needs a signed driver).
 
 ### Build it yourself
 
@@ -126,11 +130,11 @@ The [workflow](.github/workflows/release.yml) builds the exe on GitHub's Windows
 the audio tests on every push. To publish a release, push a tag:
 
 ```sh
-git tag v1.5.14-audio.1
-git push origin v1.5.14-audio.1
+git tag v1.5.14-audio.3
+git push origin v1.5.14-audio.3
 ```
 
-GitHub then attaches `Beamer-v1.5.14-audio.1.exe` to a new release.
+GitHub then attaches `Beamer-v1.5.14-audio.3.exe` to a new release.
 
 ## Quick start
 
@@ -188,8 +192,8 @@ In your own appearance: light if your GitHub is light, dark if it is dark.
   Alt, so Cmd+C copies there too. The PC gets the reverse. Between two Macs or two PCs, each key
   arrives as the same physical key. On Windows, you can also choose a Mac keyboard layout, where
   Alt acts as Command and the Windows key acts as Option.
-- **Sound follows you (this fork, Windows).** Send one PC's sound to another PC's speakers, or play
-  another PC's sound here, both ways at once, from the Audio page. See
+- **Sound follows you (this fork, Windows).** Stream a PC's sound to the others and hear theirs mixed
+  together, each with its own volume, from the Audio page. See
   [This fork](#this-fork-windows-audio-sharing).
 - **Media keys follow you.** Play, pause, skip, mute and volume cross between supported machines.
   Brightness and keyboard-backlight keys stay on the Mac.

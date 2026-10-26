@@ -1,13 +1,110 @@
-"""The Audio page: send this PC's sound to another PC, and play another PC's sound here, both at once."""
+"""The Audio page: two switches (stream this PC's sound, hear the other PCs) and, for every paired PC,
+a volume and a live level, because what the other PCs stream is mixed together here."""
 
-from PySide6.QtCore import QObject, Qt, QTimer
-from PySide6.QtWidgets import QComboBox, QPushButton
+from PySide6.QtCore import QObject, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import QHBoxLayout, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 import audio_share
+import theme
 import widgets
 from core.i18n import tr
 
-PEERS_EVERY_MS = 4000
+TICK_MS = 100
+PEERS_EVERY_TICKS = 40
+SAVE_AFTER_MS = 300
+DECAY = 0.82
+
+
+class LevelBar(QWidget):
+    """A thin meter: how loud a PC is right now."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.level = 0.0
+        self.setFixedHeight(6)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_level(self, level: float) -> None:
+        level = max(0.0, min(1.0, level))
+        if abs(level - self.level) > 0.004:
+            self.level = level
+            self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(theme.colour("rule")))
+        painter.drawRoundedRect(QRectF(self.rect()), 3, 3)
+        if self.level > 0:
+            fill = QRectF(0, 0, max(6.0, self.width() * self.level), self.height())
+            painter.setBrush(QColor(theme.colour("signal")))
+            painter.drawRoundedRect(fill, 3, 3)
+
+
+class SourceCard(widgets.Module):
+    """One PC whose sound can play here: its state, its level, its own volume."""
+
+    def __init__(self, peer: dict, volume: int, on_volume, parent=None):
+        super().__init__(peer["name"], parent)
+        self.peer_id = peer["id"]
+        self._on_volume = lambda *_: None  # nothing to save while the card is being built
+        self._before_mute = audio_share.DEFAULT_VOLUME
+        self.shown_level = 0.0
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        self.led = widgets.Led()
+        top.addWidget(self.led, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.state = widgets.label("", "note")
+        top.addWidget(self.state)
+        top.addWidget(LevelBar(), 1)
+        self.meter = top.itemAt(top.count() - 1).widget()
+        self.body.addLayout(top)
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(12)
+        self.mute = QPushButton(tr("Mute"))
+        self.mute.setCheckable(True)
+        self.mute.setCursor(Qt.CursorShape.PointingHandCursor)
+        bottom.addWidget(self.mute)
+        self.slider = widgets.Ruler(tr("Volume of {name}").format(name=peer["name"]), audio_share.MAX_VOLUME, step=5)
+        self.slider.setValue(volume)
+        bottom.addWidget(self.slider, 1)
+        self.percent = widgets.label("", "readout")
+        self.percent.setMinimumWidth(48)
+        self.percent.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bottom.addWidget(self.percent)
+        self.body.addLayout(bottom)
+
+        self.slider.valueChanged.connect(self._moved)
+        self.mute.toggled.connect(self._muted)
+        self._moved(volume)
+        self._on_volume = on_volume
+
+    def _moved(self, value: int) -> None:
+        self.percent.setText("%d%%" % value)
+        self.mute.blockSignals(True)
+        self.mute.setChecked(value == 0)
+        self.mute.blockSignals(False)
+        if value:
+            self._before_mute = value
+        self._on_volume(self.peer_id, value)
+
+    def _muted(self, on: bool) -> None:
+        self.slider.setValue(0 if on else self._before_mute)
+
+    def show_state(self, receiving: bool, info: dict) -> None:
+        playing = receiving and info.get("playing", False)
+        self.led.set_tone("signal" if playing else "off")
+        if not receiving:
+            self.state.setText(tr("Hearing is off"))
+        else:
+            self.state.setText(tr("Streaming") if playing else tr("Quiet"))
+        # A fast attack and a slow fall, so a short sound still shows.
+        self.shown_level = max(info.get("level", 0.0) if playing else 0.0, self.shown_level * DECAY)
+        self.meter.set_level(self.shown_level)
 
 
 class AudioPanel(QObject):
@@ -15,122 +112,90 @@ class AudioPanel(QObject):
         super().__init__(parent)
         self.share = share
         self._peers = None
+        self._cards = {}
+        self._ticks = 0
         if share is None:
             layout.addWidget(widgets.label(tr("Audio sharing is only available on Windows."), "note", wrap=True))
             return
 
-        send = widgets.Module(tr("Send this PC's sound"))
-        self.send_on = widgets.Switch(tr("Send this PC's sound to another PC"))
-        self.send_peer = QComboBox()
-        self.send_source = QComboBox()
-        self.mute = widgets.Switch(tr("Mute this PC's speakers while sending"))
-        self.send_status = widgets.label("", "note", wrap=True)
-        send.body.addWidget(self.send_on)
-        send.body.addWidget(widgets.FormRow(widgets.label(tr("Send to"), "key"), self.send_peer))
-        send.body.addWidget(widgets.FormRow(widgets.label(tr("Sound to send"), "key"), self.send_source))
-        send.body.addWidget(self.mute)
-        send.body.addWidget(widgets.label(tr(
-            "To keep this PC quiet, use a virtual sound device (such as VB-CABLE): choose it as the Sound to send, "
-            "then pick it as the output in Windows. Whatever plays on that output goes to the other PC only."),
-            "note", wrap=True))
-        send.body.addWidget(self.send_status)
-        layout.addWidget(send)
+        main = widgets.Module(tr("This PC"))
+        self.send_on = widgets.Switch(tr("Stream this PC's sound"))
+        self.send_note = widgets.label(
+            tr("Sends what this PC plays to every paired Windows PC that is hearing. Beamer's own sound is left out."),
+            "note", wrap=True)
+        self.send_status = widgets.label("", "note-quiet", wrap=True)
+        self.receive_on = widgets.Switch(tr("Hear the other PCs"))
+        self.receive_note = widgets.label(
+            tr("Beamer plays what the other PCs stream, mixed together, on this PC's speakers."), "note", wrap=True)
+        self.receive_status = widgets.label("", "note-quiet", wrap=True)
+        for item in (self.send_on, self.send_note, self.send_status, widgets.rule(vertical=False),
+                     self.receive_on, self.receive_note, self.receive_status):
+            main.body.addWidget(item)
+        layout.addWidget(main)
 
-        receive = widgets.Module(tr("Play another PC's sound here"))
-        self.receive_on = widgets.Switch(tr("Play another PC's sound on this PC"))
-        self.receive_peer = QComboBox()
-        self.receive_output = QComboBox()
-        self.receive_status = widgets.label("", "note", wrap=True)
-        receive.body.addWidget(self.receive_on)
-        receive.body.addWidget(widgets.FormRow(widgets.label(tr("Play sound from"), "key"), self.receive_peer))
-        receive.body.addWidget(widgets.FormRow(widgets.label(tr("Play on"), "key"), self.receive_output))
-        receive.body.addWidget(widgets.label(tr(
-            "Send and play on different devices, or the sound loops back. Both PCs need this version of Beamer and "
-            "must be paired."), "note", wrap=True))
-        receive.body.addWidget(self.receive_status)
-        layout.addWidget(receive)
+        self.sources_title = widgets.label(tr("Sources").upper(), "note-quiet")
+        layout.addWidget(self.sources_title)
+        self.sources_box = QVBoxLayout()
+        self.sources_box.setSpacing(12)
+        layout.addLayout(self.sources_box)
+        self.empty = widgets.label(
+            tr("Pair another Windows PC with this version of Beamer and it shows up here."), "note", wrap=True)
+        layout.addWidget(self.empty)
 
-        refresh = QPushButton(tr("Refresh devices"))
-        refresh.clicked.connect(self.refresh)
-        layout.addWidget(refresh, 0, Qt.AlignmentFlag.AlignLeft)
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(SAVE_AFTER_MS)
+        self._save_timer.timeout.connect(self._save)
 
         self.refresh()
-        for box in (self.send_peer, self.send_source, self.receive_peer, self.receive_output):
-            box.activated.connect(self._save)
-        for switch in (self.send_on, self.mute, self.receive_on):
-            switch.toggled.connect(self._save)
+        self.send_on.toggled.connect(self._save)
+        self.receive_on.toggled.connect(self._save)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(500)
-        self._ticks = 0
-
-    @staticmethod
-    def _select(box: QComboBox, value) -> None:
-        index = box.findData(value)
-        if index >= 0:
-            box.setCurrentIndex(index)
+        self._timer.start(TICK_MS)
 
     def refresh(self) -> None:
-        """Fill the lists from the paired machines and the sound devices, then show the saved choice."""
+        """Show the saved choice and one card for each paired PC."""
         choice = audio_share.load_audio(self.share.settings_path)
-        self._peers = audio_share.paired_peers(self.share.settings_path)
-        try:
-            devices = audio_share.output_devices()
-        except Exception:  # no PyAudioWPatch or no sound device: the lists keep the defaults
-            devices = []
-        boxes = (self.send_peer, self.send_source, self.receive_peer, self.receive_output)
-        for box in boxes:
-            box.blockSignals(True)
-            box.clear()
-        for peer in self._peers:
-            self.send_peer.addItem(peer["name"], peer["id"])
-        self.receive_peer.addItem(tr("Any paired PC"), "")
-        for peer in self._peers:
-            self.receive_peer.addItem(peer["name"], peer["id"])
-        self.send_source.addItem(tr("Default speakers"), "")
-        self.receive_output.addItem(tr("Default speakers"), "")
-        for name in devices:
-            self.send_source.addItem(name, name)
-            self.receive_output.addItem(name, name)
-        send, receive = choice["send"], choice["receive"]
-        self._select(self.send_peer, send["peer"])
-        self._select(self.send_source, send["source"])
-        self._select(self.receive_peer, receive["peer"])
-        self._select(self.receive_output, receive["output"])
-        for switch, value in ((self.send_on, send["on"]), (self.mute, send["mute_local"]), (self.receive_on, receive["on"])):
+        for switch, value in ((self.send_on, choice["send"]), (self.receive_on, choice["receive"])):
             switch.blockSignals(True)
             switch.setChecked(value)
             switch.blockSignals(False)
-        for box in boxes:
-            box.blockSignals(False)
-        self.send_peer.setEnabled(bool(self._peers))
-        self._enable()
+        self._peers = audio_share.paired_peers(self.share.settings_path)
+        for card in self._cards.values():
+            card.setParent(None)
+            card.deleteLater()
+        self._cards = {}
+        for peer in self._peers:
+            volume = self.share.volumes.get(peer["id"], choice["volumes"].get(peer["id"], audio_share.DEFAULT_VOLUME))
+            self.share.set_volume(peer["id"], volume)
+            card = SourceCard(peer, volume, self._volume_changed)
+            self._cards[peer["id"]] = card
+            self.sources_box.addWidget(card)
+        self.empty.setVisible(not self._peers)
+        self.sources_title.setVisible(bool(self._peers))
 
-    def _enable(self) -> None:
-        # Muting acts on the default speakers, so it only means something when those are what is sent.
-        self.mute.setEnabled(not self.send_source.currentData())
+    def _volume_changed(self, peer_id: str, value: int) -> None:
+        self.share.set_volume(peer_id, value)
+        self._save_timer.start()
 
     def _save(self, *_args) -> None:
-        self._enable()
         audio_share.save_choice(self.share.settings_path, {
-            "send": {
-                "on": self.send_on.isChecked(), "peer": self.send_peer.currentData() or "",
-                "source": self.send_source.currentData() or "",
-                "mute_local": self.mute.isChecked() and self.mute.isEnabled(),
-            },
-            "receive": {
-                "on": self.receive_on.isChecked(), "peer": self.receive_peer.currentData() or "",
-                "output": self.receive_output.currentData() or "",
-            },
+            "send": self.send_on.isChecked(), "receive": self.receive_on.isChecked(),
+            "volumes": {peer_id: card.slider.value() for peer_id, card in self._cards.items()},
         })
         self.share.apply()
 
     def _tick(self) -> None:
         self.send_status.setText(tr(self.share.send_status) if self.share.send_status else "")
         self.receive_status.setText(tr(self.share.receive_status) if self.share.receive_status else "")
+        receiving = self.receive_on.isChecked()
+        sources = self.share.sources
+        for peer_id, card in self._cards.items():
+            card.show_state(receiving, sources.get(peer_id, {}))
         self._ticks += 1
-        if self._ticks * 500 >= PEERS_EVERY_MS:
+        if self._ticks >= PEERS_EVERY_TICKS:
             self._ticks = 0
             if audio_share.paired_peers(self.share.settings_path) != self._peers:
                 self.refresh()

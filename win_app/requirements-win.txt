@@ -7,3 +7,4 @@ pywin32>=306
 segno>=1.6
 pycaw>=20240210; sys_platform == "win32"
 comtypes>=1.4.0; sys_platform == "win32"
+audioop-lts; python_version >= "3.13"

@@ -1,6 +1,5 @@
-"""Integration tests for audio sharing: Player buffering, AudioShare networking,
-Manager lifecycle and the Audio page. Uses fakes for PyAudioWPatch.
-"""
+"""Integration tests for audio sharing: Player buffering, receiving and mixing several PCs, streaming to
+all of them, the manager and the Audio page. Uses fakes for PyAudioWPatch and for the capture."""
 
 import json
 import os
@@ -23,6 +22,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 import audio_page
+import audio_loopback
 import audio_share
 
 # A port of its own, so the tests never meet a Beamer that is running on this machine.
@@ -141,7 +141,7 @@ class PlayerTests(unittest.TestCase):
     def test_priming_silence_until_prime_ms_buffered(self):
         """Player returns silence on pull until PRIME_MS is buffered, then plays audio."""
         rate = 48000
-        player = audio_share.Player(self.fake_module, rate, "")
+        player = audio_share.Player(self.fake_module, rate)
         self.addCleanup(player.close)
 
         # 40 ms at 48000 Hz, stereo 16-bit = 7680 bytes
@@ -172,7 +172,7 @@ class PlayerTests(unittest.TestCase):
     def test_underrun_returns_silence_and_reprimes(self):
         """When the buffer starves, Player emits silence, clears primed flag, and waits for PRIME_MS."""
         rate = 48000
-        player = audio_share.Player(self.fake_module, rate, "")
+        player = audio_share.Player(self.fake_module, rate)
         self.addCleanup(player.close)
 
         # Prime the player with 8000 bytes
@@ -207,7 +207,7 @@ class PlayerTests(unittest.TestCase):
     def test_overflow_trimming_past_max_ms(self):
         """Feeding more than MAX_MS causes the buffer to be trimmed to limit // 3, keeping newest audio."""
         rate = 48000
-        player = audio_share.Player(self.fake_module, rate, "")
+        player = audio_share.Player(self.fake_module, rate)
         self.addCleanup(player.close)
 
         limit = rate * 4 * audio_share.MAX_MS // 1000  # 38400 bytes
@@ -226,7 +226,7 @@ class PlayerTests(unittest.TestCase):
 
     def test_close_terminates_pyaudio_instance(self):
         """player.close() stops and closes the stream and terminates the PyAudio instance."""
-        player = audio_share.Player(self.fake_module, 48000, "")
+        player = audio_share.Player(self.fake_module, 48000)
         self.assertEqual(len(self.fake_module.instances), 1)
         pa_instance = self.fake_module.instances[0]
         stream = player._stream
@@ -248,7 +248,7 @@ class PlayerTests(unittest.TestCase):
 
         self.fake_module.open_hook = failing_open
         with self.assertRaises(OSError):
-            audio_share.Player(self.fake_module, 48000, "")
+            audio_share.Player(self.fake_module, 48000)
 
         self.assertEqual(len(self.fake_module.instances), 1)
         self.assertTrue(self.fake_module.instances[0].terminated)
@@ -264,772 +264,470 @@ class PlayerTests(unittest.TestCase):
                 raise OSError("WASAPI shared mode failed for device")
 
         self.fake_module.open_hook = wasapi_fails
-        player = audio_share.Player(self.fake_module, 48000, "Headphones")
+        player = audio_share.Player(self.fake_module, 48000)
         self.addCleanup(player.close)
 
-        # Should have attempted Headphones (index 1), then None
-        self.assertEqual(attempted_indices, [1, None])
+        # Should have attempted the default output (index 0), then None
+        self.assertEqual(attempted_indices, [0, None])
         self.assertIsNone(player._stream.kwargs.get("output_device_index"))
 
-    def test_device_selection_by_name_and_fallback(self):
-        """Selecting by device name finds matching WASAPI output device; missing name uses default."""
-        p1 = audio_share.Player(self.fake_module, 48000, "Headphones")
-        self.assertEqual(p1._stream.kwargs.get("output_device_index"), 1)
-        p1.close()
-
-        p2 = audio_share.Player(self.fake_module, 48000, "")
-        self.assertEqual(p2._stream.kwargs.get("output_device_index"), 0)
-        p2.close()
-
-        p3 = audio_share.Player(self.fake_module, 48000, "NonExistentDevice")
-        self.assertEqual(p3._stream.kwargs.get("output_device_index"), 0)
-        p3.close()
 
 
 # ---------------------------------------------------------------------------
-# Receive Path Tests
+# Shared set-up
 # ---------------------------------------------------------------------------
 
-class ReceivePathTests(unittest.TestCase):
+PEER_A = {"id": "pa", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "127.0.0.1"}
+PEER_B = {"id": "pb", "name": "Desk", "platform": "windows", "token": TOKEN_B, "host": "127.0.0.1"}
+
+
+class ShareCase(unittest.TestCase):
+    """A settings folder, fake PyAudio and a share that is stopped on the way out."""
+
+    peers = (PEER_A, PEER_B)
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.settings_path = Path(self.temp_dir.name) / "settings.json"
+        self.settings_path.write_text(json.dumps({"peers": list(self.peers)}), encoding="utf-8")
         self.fake_module = FakePyAudioModule()
         self._orig_pyaudio = audio_share._pyaudio
-        self._orig_idle = audio_share.IDLE_SECONDS
         audio_share._pyaudio = lambda: self.fake_module
-
-        self.peer1 = {"id": "p1", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "127.0.0.1"}
-        self.peer2 = {"id": "p2", "name": "Desk", "platform": "windows", "token": TOKEN_B, "host": "127.0.0.1"}
-        self.settings_path.write_text(json.dumps({"peers": [self.peer1, self.peer2]}), encoding="utf-8")
-        audio_share.save_audio(self.settings_path, "receive")
-
         self.share = audio_share.AudioShare(self.settings_path)
-        self.share.start()
-        wait_until(lambda: self.share.status == "Waiting for sound")
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def tearDown(self):
-        self.sock.close()
         self.share.stop()
         audio_share._pyaudio = self._orig_pyaudio
-        audio_share.IDLE_SECONDS = self._orig_idle
         self.temp_dir.cleanup()
 
-    def test_valid_datagram_updates_status_and_pcm_reaches_stream(self):
-        """A valid datagram sets status to 'Playing sound from <name>' and feeds PCM to the stream."""
-        pcm = b"\x12\x34" * 480  # 960 bytes
-        dg = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=pcm)
-        self.sock.sendto(dg, ("127.0.0.1", audio_share.PORT))
+    def choose(self, send=False, receive=False, volumes=None):
+        audio_share.save_choice(self.settings_path, {"send": send, "receive": receive, "volumes": volumes or {}})
 
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 1)
+    def players(self):
+        return [s.callback.__self__ for s in self.fake_module.all_opened_streams]
 
-        stream = self.fake_module.all_opened_streams[0]
-        player = stream.kwargs["stream_callback"].__self__
-        wait_until(lambda: len(player._buffer) >= len(pcm))
-        self.assertEqual(bytes(player._buffer[:len(pcm)]), pcm)
+    def buffered(self, index):
+        """Bytes waiting in the index-th player, or -1 before it exists."""
+        players = self.players()
+        return len(players[index]._buffer) if len(players) > index else -1
 
-    def test_wrong_token_datagram_ignored(self):
-        """Datagram sealed with an unknown token is ignored and status remains 'Waiting for sound'."""
-        pcm = bytes(960)
-        dg = audio_share.seal(TOKEN_C, session=1, sequence=1, rate=48000, pcm=pcm)
-        self.sock.sendto(dg, ("127.0.0.1", audio_share.PORT))
 
-        time.sleep(0.05)
-        self.assertEqual(self.share.status, "Waiting for sound")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 0)
+class FakeCapture:
+    """Stands in for audio_loopback.LoopbackCapture: the test calls `emit` where Windows would."""
 
-        # Subsequent valid datagram is still handled
-        valid_dg = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=pcm)
-        self.sock.sendto(valid_dg, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
+    instances = []
+    fail = None
 
-    def test_tampered_datagram_ignored(self):
-        """A datagram with tampered ciphertext fails decryption and is ignored."""
-        pcm = bytes(960)
-        dg = bytearray(audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=pcm))
-        dg[-1] ^= 0xFF
-        self.sock.sendto(bytes(dg), ("127.0.0.1", audio_share.PORT))
+    def __init__(self, on_chunk):
+        self.on_chunk = on_chunk
+        self.started = 0
+        self.stopped = 0
+        FakeCapture.instances.append(self)
 
-        time.sleep(0.05)
-        self.assertEqual(self.share.status, "Waiting for sound")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 0)
+    def start(self):
+        if FakeCapture.fail:
+            raise FakeCapture.fail
+        self.started += 1
 
-        # Subsequent valid datagram succeeds
-        valid_dg = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=pcm)
-        self.sock.sendto(valid_dg, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
+    def stop(self):
+        self.stopped += 1
 
-    def test_short_datagram_ignored(self):
-        """Datagrams shorter than SEALED_MIN are ignored."""
-        self.sock.sendto(b"too_short", ("127.0.0.1", audio_share.PORT))
 
-        time.sleep(0.05)
-        self.assertEqual(self.share.status, "Waiting for sound")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 0)
+def fake_capture(case, available=True, fail=None):
+    FakeCapture.instances = []
+    FakeCapture.fail = fail
+    for name, value in (("LoopbackCapture", FakeCapture), ("available", lambda: available)):
+        original = getattr(audio_loopback, name)
+        setattr(audio_loopback, name, value)
+        case.addCleanup(setattr, audio_loopback, name, original)
 
-        valid_dg = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=bytes(960))
-        self.sock.sendto(valid_dg, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
 
-    def test_oversize_datagram_ignored(self):
-        # Regression (fixed): on Windows, sending a UDP datagram larger than MAX_DATAGRAM (4096 bytes) causes
-        # sock.recv(MAX_DATAGRAM) in audio_share.py to raise OSError: [WinError 10040] (WSAEMSGSIZE).
-        # audio_share.py lines 357-358 catch OSError and unconditionally 'break', terminating the
-        # receive worker thread permanently instead of ignoring the oversize packet.
-        # As a result, all subsequent valid datagrams are dropped and playback never starts.
-        oversize_payload = b"X" * 5000
-        self.sock.sendto(oversize_payload, ("127.0.0.1", audio_share.PORT))
-        time.sleep(0.05)
-
-        valid_dg = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=bytes(960))
-        self.sock.sendto(valid_dg, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop", timeout=1.0)
-
-    def test_repeated_sequence_ignored(self):
-        """A datagram with a sequence number <= the last heard sequence in the same session is ignored."""
-        pcm1 = b"\x01" * 960
-        dg1 = audio_share.seal(TOKEN_A, session=1, sequence=5, rate=48000, pcm=pcm1)
-        self.sock.sendto(dg1, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-
-        stream = self.fake_module.all_opened_streams[0]
-        player = stream.kwargs["stream_callback"].__self__
-        wait_until(lambda: len(player._buffer) == 960)
-
-        # Send duplicate sequence 5
-        pcm_dup = b"\x02" * 960
-        dg_dup = audio_share.seal(TOKEN_A, session=1, sequence=5, rate=48000, pcm=pcm_dup)
-        self.sock.sendto(dg_dup, ("127.0.0.1", audio_share.PORT))
-        time.sleep(0.05)
-        self.assertEqual(len(player._buffer), 960)
-
-    def test_older_sequence_ignored(self):
-        """A datagram with an older sequence number than previously received is ignored."""
-        pcm1 = b"\x01" * 960
-        dg1 = audio_share.seal(TOKEN_A, session=1, sequence=5, rate=48000, pcm=pcm1)
-        self.sock.sendto(dg1, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-
-        stream = self.fake_module.all_opened_streams[0]
-        player = stream.kwargs["stream_callback"].__self__
-        wait_until(lambda: len(player._buffer) == 960)
-
-        # Send older sequence 4
-        pcm_old = b"\x02" * 960
-        dg_old = audio_share.seal(TOKEN_A, session=1, sequence=4, rate=48000, pcm=pcm_old)
-        self.sock.sendto(dg_old, ("127.0.0.1", audio_share.PORT))
-        time.sleep(0.05)
-        self.assertEqual(len(player._buffer), 960)
-
-        # Send newer sequence 6
-        pcm_new = b"\x03" * 960
-        dg_new = audio_share.seal(TOKEN_A, session=1, sequence=6, rate=48000, pcm=pcm_new)
-        self.sock.sendto(dg_new, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: len(player._buffer) == 1920)
-
-    def test_new_session_accepted_even_with_lower_sequence(self):
-        """When session id changes (sender restarted), sequence check resets."""
-        dg1 = audio_share.seal(TOKEN_A, session=10, sequence=5, rate=48000, pcm=b"\x01" * 960)
-        self.sock.sendto(dg1, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-
-        stream = self.fake_module.all_opened_streams[0]
-        player = stream.kwargs["stream_callback"].__self__
-        wait_until(lambda: len(player._buffer) == 960)
-
-        # New session with sequence 1
-        dg2 = audio_share.seal(TOKEN_A, session=11, sequence=1, rate=48000, pcm=b"\x02" * 960)
-        self.sock.sendto(dg2, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: len(player._buffer) == 1920)
-
-    def test_second_peer_ignored_while_first_active(self):
-        """A second peer's datagram is ignored while the first peer is active."""
-        dg1 = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=b"\x01" * 960)
-        self.sock.sendto(dg1, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-
-        stream = self.fake_module.all_opened_streams[0]
-        player = stream.kwargs["stream_callback"].__self__
-        wait_until(lambda: len(player._buffer) == 960)
-
-        # Immediately send from peer 2
-        dg2 = audio_share.seal(TOKEN_B, session=1, sequence=1, rate=48000, pcm=b"\x02" * 960)
-        self.sock.sendto(dg2, ("127.0.0.1", audio_share.PORT))
-        time.sleep(0.05)
-
-        self.assertEqual(self.share.status, "Playing sound from Laptop")
-        self.assertEqual(len(player._buffer), 960)
-
-    def test_second_peer_accepted_after_idle_seconds(self):
-        """After IDLE_SECONDS pass with no audio from the first peer, a second peer is accepted."""
-        audio_share.IDLE_SECONDS = 0.05
-
-        dg1 = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=b"\x01" * 960)
-        self.sock.sendto(dg1, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-
-        # Wait for idle timeout
-        wait_until(lambda: self.share.status == "Waiting for sound", timeout=1.5)
-
-        # Peer 2 sends audio
-        dg2 = audio_share.seal(TOKEN_B, session=1, sequence=1, rate=48000, pcm=b"\x02" * 960)
-        self.sock.sendto(dg2, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Desk")
-
-        self.assertEqual(len(self.fake_module.all_opened_streams), 2)
-        stream2 = self.fake_module.all_opened_streams[1]
-        player2 = stream2.kwargs["stream_callback"].__self__
-        wait_until(lambda: len(player2._buffer) == 960)
-        self.assertEqual(bytes(player2._buffer), b"\x02" * 960)
-
-    def test_second_peer_status_when_packets_continuous_during_idle(self):
-        # Regression (fixed): when a second peer takes over after IDLE_SECONDS without a socket.timeout occurring
-        # (e.g. peer 2 was actively sending packets while peer 1 went silent), line 369 in audio_share.py
-        # checks `if player is None or player.rate != rate:` before updating self.status.
-        # Because player is already open and sample rate is unchanged, line 374 is skipped, and
-        # self.status remains "Playing sound from <peer1>" even though sound from peer2 is playing.
-        audio_share.IDLE_SECONDS = 0.1
-
-        dg1 = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=bytes(960))
-        self.sock.sendto(dg1, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-
-        # Peer 2 sends packets at intervals shorter than socket timeout (0.5s) for > IDLE_SECONDS
-        start = time.monotonic()
-        seq = 1
-        while time.monotonic() - start < 0.3:
-            time.sleep(0.04)
-            seq += 1
-            dg2 = audio_share.seal(TOKEN_B, session=2, sequence=seq, rate=48000, pcm=bytes(960))
-            self.sock.sendto(dg2, ("127.0.0.1", audio_share.PORT))
-
-        # Status should update to "Playing sound from Desk", but fails due to line 369 bug
-        self.assertEqual(self.share.status, "Playing sound from Desk")
-
-    def test_peer_filter_rejects_other_paired_peers(self):
-        """When audio.json sets 'peer' to a specific id, datagrams from other paired peers are rejected."""
-        self.share.stop()
-        audio_share.save_audio(self.settings_path, "receive", peer="p1")
-        self.share = audio_share.AudioShare(self.settings_path)
-        self.share.start()
-        wait_until(lambda: self.share.status == "Waiting for sound")
-
-        # Peer 2 is paired, but peer filter is set to p1
-        dg2 = audio_share.seal(TOKEN_B, session=1, sequence=1, rate=48000, pcm=bytes(960))
-        self.sock.sendto(dg2, ("127.0.0.1", audio_share.PORT))
-        time.sleep(0.05)
-        self.assertEqual(self.share.status, "Waiting for sound")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 0)
-
-        # Peer 1 matches the filter
-        dg1 = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=bytes(960))
-        self.sock.sendto(dg1, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-
-    def test_rate_change_reopens_player(self):
-        """When incoming sample rate changes, the old Player is closed and a new Player is opened."""
-        dg1 = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=bytes(960))
-        self.sock.sendto(dg1, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 1)
-        stream1 = self.fake_module.all_opened_streams[0]
-        self.assertEqual(stream1.kwargs["rate"], 48000)
-
-        # Rate change to 44100
-        dg2 = audio_share.seal(TOKEN_A, session=1, sequence=2, rate=44100, pcm=bytes(880))
-        self.sock.sendto(dg2, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: len(self.fake_module.all_opened_streams) == 2)
-        stream2 = self.fake_module.all_opened_streams[1]
-
-        self.assertTrue(stream1.is_stopped)
-        self.assertTrue(stream1.is_closed)
-        self.assertEqual(stream2.kwargs["rate"], 44100)
-        self.assertEqual(self.share.status, "Playing sound from Laptop")
-
-    def test_idle_timeout_resets_status(self):
-        """When incoming datagrams stop, status resets to 'Waiting for sound' and Player is closed."""
-        audio_share.IDLE_SECONDS = 0.05
-
-        dg = audio_share.seal(TOKEN_A, session=1, sequence=1, rate=48000, pcm=bytes(960))
-        self.sock.sendto(dg, ("127.0.0.1", audio_share.PORT))
-        wait_until(lambda: self.share.status == "Playing sound from Laptop")
-        stream = self.fake_module.all_opened_streams[0]
-
-        # Stop sending and wait for idle timeout
-        wait_until(lambda: self.share.status == "Waiting for sound", timeout=1.5)
-        self.assertTrue(stream.is_stopped)
-        self.assertTrue(stream.is_closed)
+def pcm_of(value, frames=240):
+    return array("h", [value] * (frames * 2)).tobytes()
 
 
 # ---------------------------------------------------------------------------
-# Send Path Tests
+# Receiving and mixing
 # ---------------------------------------------------------------------------
 
-class SendPathTests(unittest.TestCase):
+class ReceiveTests(ShareCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.settings_path = Path(self.temp_dir.name) / "settings.json"
-        self.fake_module = FakePyAudioModule()
-        self._orig_pyaudio = audio_share._pyaudio
-        audio_share._pyaudio = lambda: self.fake_module
+        super().setUp()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(self.sock.close)
+        self.sequence = {}
 
-        self.token = TOKEN_A
-        self.peer = {"id": "p1", "name": "Laptop", "platform": "windows", "token": self.token, "host": "127.0.0.1"}
-        self.settings_path.write_text(json.dumps({"peers": [self.peer]}), encoding="utf-8")
-        audio_share.save_audio(self.settings_path, "send", peer="p1")
+    def send(self, token, pcm, session=1, sequence=None, rate=48000):
+        self.sequence[token] = sequence or self.sequence.get(token, 0) + 1
+        self.sock.sendto(audio_share.seal(token, session, self.sequence[token], rate, pcm), ("127.0.0.1", audio_share.PORT))
 
+    def listen(self, volumes=None):
+        self.choose(receive=True, volumes=volumes)
+        self.share.start()
+        wait_until(lambda: self.share.receive_status == "Listening for other PCs")
+
+    def test_a_pc_that_streams_is_played(self):
+        self.listen()
+        self.send(TOKEN_A, pcm_of(1000))
+        wait_until(lambda: self.share.receive_status == "Playing from Laptop")
+        self.assertTrue(self.share.sources["pa"]["playing"])
+        self.assertFalse(self.share.sources["pb"]["playing"])
+        wait_until(lambda: self.buffered(0) == 960)
+
+    def test_two_pcs_are_mixed_each_on_its_own_stream(self):
+        self.listen()
+        self.send(TOKEN_A, pcm_of(1000))
+        self.send(TOKEN_B, pcm_of(2000))
+        wait_until(lambda: len(self.players()) == 2)
+        self.assertEqual(self.share.receive_status, "Playing from Laptop, Desk")
+        players = self.players()
+        wait_until(lambda: all(len(p._buffer) == 960 for p in players))
+        self.assertEqual({bytes(p._buffer) for p in players}, {pcm_of(1000), pcm_of(2000)})
+
+    def test_each_source_has_its_own_volume(self):
+        self.listen(volumes={"pa": 50, "pb": 150})
+        self.send(TOKEN_A, pcm_of(1000))
+        self.send(TOKEN_B, pcm_of(1000))
+        wait_until(lambda: len(self.players()) == 2)
+        players = self.players()
+        wait_until(lambda: all(len(p._buffer) == 960 for p in players))
+        self.assertEqual({bytes(p._buffer) for p in players}, {pcm_of(500), pcm_of(1500)})
+
+    def test_a_muted_source_is_not_played_but_is_still_shown(self):
+        self.listen(volumes={"pa": 0})
+        self.send(TOKEN_A, pcm_of(1000))
+        wait_until(lambda: self.share.sources["pa"]["playing"])
+        self.assertEqual(self.buffered(0), 0)
+
+    def test_a_volume_change_takes_effect_on_the_next_datagram(self):
+        self.listen()
+        self.send(TOKEN_A, pcm_of(1000))
+        wait_until(lambda: self.buffered(0) == 960)
+        self.share.set_volume("pa", 25)
+        self.send(TOKEN_A, pcm_of(1000))
+        wait_until(lambda: self.buffered(0) == 1920)
+        self.assertEqual(bytes(self.players()[0]._buffer[960:]), pcm_of(250))
+
+    def test_volume_is_clamped(self):
+        self.share.set_volume("pa", 900)
+        self.share.set_volume("pb", -5)
+        self.assertEqual(self.share.volumes, {"pa": audio_share.MAX_VOLUME, "pb": 0})
+
+    def test_the_level_follows_the_loudness(self):
+        self.listen()
+        self.send(TOKEN_A, pcm_of(16384))
+        wait_until(lambda: self.share.sources["pa"]["level"] == 0.5)
+
+    def test_a_source_that_goes_quiet_is_freed_and_the_others_keep_playing(self):
+        audio_share.IDLE_SECONDS = 0.3
+        self.addCleanup(setattr, audio_share, "IDLE_SECONDS", 1.5)
+        self.listen()
+        self.send(TOKEN_A, pcm_of(1000))
+        self.send(TOKEN_B, pcm_of(1000))
+        wait_until(lambda: self.share.receive_status == "Playing from Laptop, Desk")
+        deadline = time.monotonic() + 3
+        while self.share.sources["pa"]["playing"] and time.monotonic() < deadline:
+            self.send(TOKEN_B, pcm_of(1000))
+            time.sleep(0.05)
+        self.assertFalse(self.share.sources["pa"]["playing"])
+        self.assertTrue(self.share.sources["pb"]["playing"])
+        self.assertEqual(self.share.receive_status, "Playing from Desk")
+        self.assertTrue(self.players()[0]._pa.terminated)
+
+    def test_a_new_rate_reopens_only_that_source(self):
+        self.listen()
+        self.send(TOKEN_A, pcm_of(1000), rate=48000)
+        wait_until(lambda: len(self.players()) == 1)
+        self.send(TOKEN_A, pcm_of(1000, frames=220), rate=44100)
+        wait_until(lambda: len(self.players()) == 2)
+        self.assertEqual(self.players()[1].rate, 44100)
+        self.assertTrue(self.players()[0]._pa.terminated)
+
+    def test_wrong_tampered_short_and_unknown_datagrams_are_ignored(self):
+        self.listen()
+        good = audio_share.seal(TOKEN_A, 1, 1, 48000, pcm_of(1000))
+        tampered = bytearray(good)
+        tampered[-1] ^= 1
+        for datagram in (audio_share.seal(TOKEN_C, 1, 1, 48000, pcm_of(1000)), bytes(tampered), b"x" * 10, b"y" * 200):
+            self.sock.sendto(datagram, ("127.0.0.1", audio_share.PORT))
+        self.send(TOKEN_A, pcm_of(1000))
+        wait_until(lambda: self.share.receive_status == "Playing from Laptop")
+        self.assertEqual(len(self.players()), 1)
+
+    def test_an_oversize_datagram_does_not_stop_the_listener(self):
+        self.listen()
+        self.sock.sendto(b"X" * 5000, ("127.0.0.1", audio_share.PORT))
+        time.sleep(0.05)
+        self.send(TOKEN_A, pcm_of(1000))
+        wait_until(lambda: self.share.receive_status == "Playing from Laptop")
+
+    def test_a_repeated_or_older_sequence_is_dropped_but_a_new_session_is_not(self):
+        self.listen()
+        self.send(TOKEN_A, pcm_of(1000), sequence=5)
+        wait_until(lambda: self.buffered(0) == 960)
+        self.send(TOKEN_A, pcm_of(1000), sequence=5)
+        self.send(TOKEN_A, pcm_of(1000), sequence=3)
+        self.send(TOKEN_A, pcm_of(2000), session=2, sequence=1)
+        wait_until(lambda: self.buffered(0) == 1920)
+        time.sleep(0.1)
+        self.assertEqual(self.buffered(0), 1920)
+
+
+# ---------------------------------------------------------------------------
+# Streaming to every paired PC
+# ---------------------------------------------------------------------------
+
+class SendTests(ShareCase):
+    def setUp(self):
+        super().setUp()
+        fake_capture(self)
+        # Both peers live on the loopback address, so one socket hears every datagram.
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.recv_sock.bind(("127.0.0.1", audio_share.PORT))
         self.recv_sock.settimeout(1.0)
+        self.addCleanup(self.recv_sock.close)
 
-        self.share = audio_share.AudioShare(self.settings_path)
+    def stream(self):
+        self.choose(send=True)
         self.share.start()
-        wait_until(lambda: self.share.status == "Sending this PC's sound")
-        self.stream = self.fake_module.all_opened_streams[0]
-        self.push = self.stream.callback
+        wait_until(lambda: FakeCapture.instances and FakeCapture.instances[0].started)
+        return FakeCapture.instances[0]
 
-    def tearDown(self):
+    def test_it_starts_one_capture_and_says_who_gets_it(self):
+        self.stream()
+        self.assertEqual(len(FakeCapture.instances), 1)
+        wait_until(lambda: self.share.send_status == "Streaming this PC's sound to 2 PCs")
+
+    def test_a_chunk_becomes_sealed_slices_for_every_pc(self):
+        capture = self.stream()
+        capture.on_chunk(pcm_of(7, frames=480))  # 1920 bytes: two slices
+        opened = []
+        for _ in range(4):
+            datagram = self.recv_sock.recv(4096)
+            for name, token in (("pa", TOKEN_A), ("pb", TOKEN_B)):
+                if datagram[:audio_share.KEY_ID_SIZE] == audio_share.audio_key_id(token):
+                    opened.append((name,) + audio_share.unseal(token, datagram))
+        self.assertEqual(sorted(name for name, *_ in opened), ["pa", "pa", "pb", "pb"])
+        self.assertTrue(all(len(item[4]) == audio_share.SLICE_BYTES and item[3] == audio_loopback.RATE for item in opened))
+        self.assertEqual(sorted({item[2] for item in opened}), [1, 2])
+
+    def test_a_send_error_is_swallowed(self):
+        capture = self.stream()
+        with patch("socket.socket.sendto", side_effect=OSError("network down")):
+            capture.on_chunk(pcm_of(7))
+
+    def test_stopping_stops_the_capture(self):
+        capture = self.stream()
         self.share.stop()
-        self.recv_sock.close()
-        audio_share._pyaudio = self._orig_pyaudio
-        self.temp_dir.cleanup()
+        self.assertEqual(capture.stopped, 1)
+        self.share.stop()  # a second stop is harmless
+        self.assertEqual(capture.stopped, 1)
 
-    def test_send_callback_produces_valid_datagram_with_correct_token(self):
-        """AudioShare send callback sends a UDP datagram with key id and valid ciphertext."""
-        pcm = array("h", [i % 32767 for i in range(480)]).tobytes()  # 240 stereo frames = 960 bytes
-        ret, flag = self.push(pcm, 240, None, None)
-        self.assertIsNone(ret)
-        self.assertEqual(flag, self.fake_module.paContinue)
-
-        datagram, _ = self.recv_sock.recvfrom(4096)
-        self.assertTrue(datagram.startswith(audio_share.audio_key_id(self.token)))
-
-        opened = audio_share.unseal(self.token, datagram)
-        self.assertIsNotNone(opened)
-        session, sequence, rate, received_pcm = opened
-        self.assertEqual(sequence, 1)
-        self.assertEqual(rate, 48000)
-        self.assertEqual(received_pcm, pcm)
-
-        # Cannot unseal with wrong token
-        self.assertIsNone(audio_share.unseal(TOKEN_B, datagram))
-
-    def test_send_sequence_increments(self):
-        """Each chunk pushed through the callback increments the sequence number."""
-        for expected_seq in range(1, 4):
-            self.push(bytes(960), 240, None, None)
-            datagram, _ = self.recv_sock.recvfrom(4096)
-            _, seq, _, _ = audio_share.unseal(self.token, datagram)
-            self.assertEqual(seq, expected_seq)
-
-    def test_send_channel_downmix_surround_to_stereo(self):
-        """When capturing 6-channel surround sound, callback downmixes to stereo."""
-        self.share.stop()
-        self.fake_module.loopback["maxInputChannels"] = 6
-        self.fake_module.all_opened_streams.clear()
-
-        self.share = audio_share.AudioShare(self.settings_path)
+    def test_without_a_paired_pc_there_is_nothing_to_stream_to(self):
+        self.settings_path.write_text(json.dumps({"peers": []}), encoding="utf-8")
+        self.choose(send=True)
         self.share.start()
-        wait_until(lambda: self.share.status == "Sending this PC's sound")
+        wait_until(lambda: self.share.send_status == "Pair another Windows PC to stream to")
+        self.assertEqual(FakeCapture.instances, [])
 
-        stream = self.fake_module.all_opened_streams[0]
-        push = stream.callback
-
-        # 240 frames of 6 int16 samples
-        raw_samples = [((frame * 6 + ch) * 100) % 32767 for frame in range(240) for ch in range(6)]
-        surround_data = array("h", raw_samples).tobytes()
-
-        push(surround_data, 240, None, None)
-        datagram, _ = self.recv_sock.recvfrom(4096)
-        _, _, _, pcm = audio_share.unseal(self.token, datagram)
-
-        expected_stereo = audio_share.to_stereo(surround_data, 6)
-        self.assertEqual(pcm, expected_stereo)
-
-    def test_send_channel_downmix_mono_to_stereo(self):
-        """When capturing 1-channel mono sound, callback doubles mono to stereo."""
-        self.share.stop()
-        self.fake_module.loopback["maxInputChannels"] = 1
-        self.fake_module.all_opened_streams.clear()
-
-        self.share = audio_share.AudioShare(self.settings_path)
-        self.share.start()
-        wait_until(lambda: self.share.status == "Sending this PC's sound")
-
-        stream = self.fake_module.all_opened_streams[0]
-        push = stream.callback
-
-        mono_samples = [(frame * 100) % 32767 for frame in range(240)]
-        mono_data = array("h", mono_samples).tobytes()
-
-        push(mono_data, 240, None, None)
-        datagram, _ = self.recv_sock.recvfrom(4096)
-        _, _, _, pcm = audio_share.unseal(self.token, datagram)
-
-        expected_stereo = audio_share.to_stereo(mono_data, 1)
-        self.assertEqual(pcm, expected_stereo)
-
-    def test_sendto_oserror_swallowed(self):
-        """If sock.sendto raises OSError (network unreachable), callback swallows it and returns paContinue."""
-        with patch.object(socket.socket, "sendto", side_effect=OSError("Network unreachable")):
-            ret, flag = self.push(bytes(960), 240, None, None)
-            self.assertIsNone(ret)
-            self.assertEqual(flag, self.fake_module.paContinue)
+    def test_a_new_address_restarts_the_stream(self):
+        self.stream()
+        moved = dict(PEER_A, host="127.0.0.2")
+        self.settings_path.write_text(json.dumps({"peers": [moved, PEER_B]}), encoding="utf-8")
+        self.share.apply()
+        wait_until(lambda: len(FakeCapture.instances) == 2)
+        self.assertEqual(FakeCapture.instances[0].stopped, 1)
 
 
-# ---------------------------------------------------------------------------
-# Manager Tests
-# ---------------------------------------------------------------------------
+class SendFallbackTests(ShareCase):
+    """Where Windows cannot leave Beamer's own sound out, the whole mix is streamed, but never while hearing."""
 
-class ManagerTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.settings_path = Path(self.temp_dir.name) / "settings.json"
-        self.fake_module = FakePyAudioModule()
-        self._orig_pyaudio = audio_share._pyaudio
-        audio_share._pyaudio = lambda: self.fake_module
+        super().setUp()
+        self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.recv_sock.bind(("127.0.0.1", audio_share.PORT))
+        self.recv_sock.settimeout(1.0)
+        self.addCleanup(self.recv_sock.close)
 
-        self.peer = {"id": "p1", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "127.0.0.1"}
-        self.settings_path.write_text(json.dumps({"peers": [self.peer]}), encoding="utf-8")
-
-        self.share = audio_share.AudioShare(self.settings_path)
-
-    def tearDown(self):
-        self.share.stop()
-        audio_share._pyaudio = self._orig_pyaudio
-        self.temp_dir.cleanup()
-
-    def test_mode_transitions_tear_down_previous_side_and_free_port(self):
-        """Transitioning modes tears down previous sockets and streams, freeing UDP PORT."""
-        # Start in receive mode
-        audio_share.save_audio(self.settings_path, "receive")
+    def test_without_exclusion_and_not_hearing_the_plain_loopback_is_streamed(self):
+        fake_capture(self, available=False)
+        self.fake_module.loopback = {"index": 3, "name": "Loopback", "defaultSampleRate": 44100, "maxInputChannels": 6}
+        self.choose(send=True)
         self.share.start()
-        wait_until(lambda: self.share.status == "Waiting for sound")
+        wait_until(lambda: self.fake_module.all_opened_streams)
+        stream = self.fake_module.all_opened_streams[0]
+        self.assertEqual((stream.kwargs["input_device_index"], stream.kwargs["rate"]), (3, 44100))
+        stream.callback(array("h", range(12)).tobytes(), 1, None, None)
+        datagram = self.recv_sock.recv(4096)
+        token = TOKEN_A if datagram[:audio_share.KEY_ID_SIZE] == audio_share.audio_key_id(TOKEN_A) else TOKEN_B
+        _session, _sequence, rate, pcm = audio_share.unseal(token, datagram)
+        self.assertEqual((rate, pcm), (44100, array("h", [0, 1, 6, 7]).tobytes()))
 
-        # Port is bound by receive mode
-        probe_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        with self.assertRaises(OSError):
-            probe_sock.bind(("", audio_share.PORT))
-        probe_sock.close()
+    def test_without_exclusion_and_hearing_it_refuses_but_hearing_goes_on(self):
+        fake_capture(self, available=False)
+        self.choose(send=True, receive=True)
+        self.share.start()
+        wait_until(lambda: "Turn off Hear other PCs" in self.share.send_status)
+        wait_until(lambda: self.share.receive_status == "Listening for other PCs")
+        self.assertEqual([s for s in self.fake_module.all_opened_streams if s.kwargs.get("input")], [])
 
-        # Switch to mode "off"
-        audio_share.save_audio(self.settings_path, "off")
+    def test_turning_hearing_on_while_the_plain_mix_is_streamed_stops_the_stream(self):
+        fake_capture(self, available=False)
+        self.choose(send=True)
+        self.share.start()
+        wait_until(lambda: self.share.send_status.startswith("Streaming"))
+        self.choose(send=True, receive=True)
         self.share.apply()
-        wait_until(lambda: self.share.status == "")
+        wait_until(lambda: "Turn off Hear other PCs" in self.share.send_status)
+        self.assertTrue(self.fake_module.all_opened_streams[0].is_closed)
 
-        # Verify PORT is freed and can be bound
-        probe_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        probe_sock.bind(("", audio_share.PORT))
-        probe_sock.close()
+    def test_a_capture_that_will_not_start_is_treated_the_same(self):
+        fake_capture(self, fail=OSError("no process loopback"))
+        self.choose(send=True, receive=True)
+        self.share.start()
+        wait_until(lambda: "Turn off Hear other PCs" in self.share.send_status)
 
-        # Switch to mode "send"
-        audio_share.save_audio(self.settings_path, "send", peer="p1")
+
+# ---------------------------------------------------------------------------
+# The manager
+# ---------------------------------------------------------------------------
+
+class ManagerTests(ShareCase):
+    def setUp(self):
+        super().setUp()
+        fake_capture(self)
+
+    def test_the_two_sides_start_and_stop_independently(self):
+        self.choose(send=True)
+        self.share.start()
+        wait_until(lambda: FakeCapture.instances)
+        self.assertEqual(self.share.receive_status, "")
+        self.choose(send=True, receive=True)
         self.share.apply()
-        wait_until(lambda: self.share.status == "Sending this PC's sound")
-
-        # Send mode does not bind to PORT: port remains free
-        probe_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        probe_sock.bind(("", audio_share.PORT))
-        probe_sock.close()
-        time.sleep(0.05)
-
-        # Switch back to "receive"
-        audio_share.save_audio(self.settings_path, "receive")
+        wait_until(lambda: self.share.receive_status == "Listening for other PCs")
+        self.assertEqual(FakeCapture.instances[0].stopped, 0)
+        self.choose(send=False, receive=True)
         self.share.apply()
-        wait_until(lambda: self.share.status == "Waiting for sound")
-
-        # Switch to "off" cleans up
-        audio_share.save_audio(self.settings_path, "off")
+        wait_until(lambda: self.share.send_status == "")
+        self.assertEqual(FakeCapture.instances[0].stopped, 1)
+        self.choose()
         self.share.apply()
-        wait_until(lambda: self.share.status == "")
+        wait_until(lambda: self.share.receive_status == "")
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(probe.close)
+        probe.bind(("", audio_share.PORT))  # the port is free again
 
-    def test_send_mode_unknown_peer_gives_status(self):
-        """Send mode with an unknown peer id sets status to 'Choose a paired machine to send to'."""
-        audio_share.save_audio(self.settings_path, "send", peer="unknown_id")
+    def test_a_failure_on_one_side_leaves_the_other_running(self):
+        FakeCapture.fail = RuntimeError("Audio hardware lost")
+        self.choose(send=True, receive=True)
         self.share.start()
-        wait_until(lambda: self.share.status == "Choose a paired machine to send to")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 0)
-
-    def test_send_mode_hostless_peer_gives_status(self):
-        """Send mode with a peer that lacks a host sets status to 'Choose a paired machine to send to'."""
-        hostless_peer = {"id": "p_nohost", "name": "NoHost", "platform": "windows", "token": TOKEN_A, "host": ""}
-        self.settings_path.write_text(json.dumps({"peers": [hostless_peer]}), encoding="utf-8")
-        audio_share.save_audio(self.settings_path, "send", peer="p_nohost")
-        self.share.start()
-        wait_until(lambda: self.share.status == "Choose a paired machine to send to")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 0)
-
-    def test_send_mode_empty_peer_gives_status(self):
-        """Send mode with peer='' sets status to 'Choose a paired machine to send to'."""
-        audio_share.save_audio(self.settings_path, "send", peer="")
-        self.share.start()
-        wait_until(lambda: self.share.status == "Choose a paired machine to send to")
-        self.assertEqual(len(self.fake_module.all_opened_streams), 0)
-
-    def test_settings_json_peer_host_change_restarts_sending(self):
-        """When a peer's host in settings.json changes, sending tears down and restarts with the new host."""
-        audio_share.save_audio(self.settings_path, "send", peer="p1")
-        self.share.start()
-        wait_until(lambda: self.share.status == "Sending this PC's sound")
-
-        self.assertEqual(len(self.fake_module.all_opened_streams), 1)
-        stream1 = self.fake_module.all_opened_streams[0]
-
-        # Update peer's host in settings.json
-        updated_peer = dict(self.peer, host="127.0.0.2")
-        self.settings_path.write_text(json.dumps({"peers": [updated_peer]}), encoding="utf-8")
-        self.share.apply()
-
-        wait_until(lambda: len(self.fake_module.all_opened_streams) == 2)
-        stream2 = self.fake_module.all_opened_streams[1]
-
-        self.assertTrue(stream1.is_stopped)
-        self.assertTrue(stream1.is_closed)
-        self.assertFalse(stream2.is_stopped)
-        self.assertEqual(self.share._applied["send"], ("send", "127.0.0.2", TOKEN_A, False, ""))
-
-    def test_exceptions_set_status_and_do_not_kill_thread(self):
-        """An unhandled error in reconcile sets self.status and leaves the worker thread alive."""
-        audio_share.save_audio(self.settings_path, "send", peer="p1")
-
-        def failing_open(_kwargs):
-            raise RuntimeError("Audio hardware lost")
-
-        self.fake_module.open_hook = failing_open
-        self.share.start()
-
-        wait_until(lambda: self.share.status == "Audio hardware lost")
+        wait_until(lambda: "Turn off Hear other PCs" in self.share.send_status)
+        wait_until(lambda: self.share.receive_status == "Listening for other PCs")
         self.assertTrue(self.share._thread.is_alive())
 
-        # Recover by fixing the error and switching to off
-        self.fake_module.open_hook = None
-        audio_share.save_audio(self.settings_path, "off")
-        self.share.apply()
-        wait_until(lambda: self.share.status == "")
-        self.assertTrue(self.share._thread.is_alive())
-
-    def test_stop_is_clean_and_idempotent(self):
-        """stop() terminates worker threads and can be called repeatedly without error."""
-        audio_share.save_audio(self.settings_path, "receive")
+    def test_a_port_that_is_taken_is_reported(self):
+        taken = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        taken.bind(("", audio_share.PORT))
+        self.addCleanup(taken.close)
+        self.choose(receive=True)
         self.share.start()
-        wait_until(lambda: self.share._thread is not None and self.share._thread.is_alive())
+        wait_until(lambda: self.share.receive_status)
+        self.assertNotIn("Listening", self.share.receive_status)
 
+    def test_stop_is_clean_and_repeatable(self):
+        self.choose(send=True, receive=True)
+        self.share.start()
+        wait_until(lambda: self.share.receive_status == "Listening for other PCs")
         self.share.stop()
-        self.assertTrue(self.share._stopped.is_set())
+        self.share.stop()
         self.assertFalse(self.share._thread.is_alive())
 
-        # Idempotent calls
-        self.share.stop()
-        self.share.stop()
 
+# ---------------------------------------------------------------------------
+# The Audio page (Qt, offscreen)
+# ---------------------------------------------------------------------------
 
-class MuteLocalTests(unittest.TestCase):
-    """Sending with the mute option tick mutes this PC's speakers and gives them back."""
-
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.settings_path = Path(self.temp_dir.name) / "settings.json"
-        self.fake_module = FakePyAudioModule()
-        self._orig_pyaudio = audio_share._pyaudio
-        audio_share._pyaudio = lambda: self.fake_module
-        self.events = []
-        events = self.events
-
-        class FakeMute:
-            def mute(self):
-                events.append("mute")
-                return True
-
-            def restore(self):
-                events.append("restore")
-                return True
-
-        self._orig_mute = audio_share.audio_mute.SpeakerMute
-        audio_share.audio_mute.SpeakerMute = FakeMute
-        peer = {"id": "p1", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "127.0.0.1"}
-        self.settings_path.write_text(json.dumps({"peers": [peer]}), encoding="utf-8")
-        self.share = audio_share.AudioShare(self.settings_path)
-
-    def tearDown(self):
-        self.share.stop()
-        audio_share.audio_mute.SpeakerMute = self._orig_mute
-        audio_share._pyaudio = self._orig_pyaudio
-        self.temp_dir.cleanup()
-
-    def test_mute_then_restore_around_sending(self):
-        audio_share.save_audio(self.settings_path, "send", "p1", mute_local=True)
-        self.share.start()
-        wait_until(lambda: self.events == ["mute"])
-        audio_share.save_audio(self.settings_path, "off")
-        self.share.apply()
-        wait_until(lambda: self.events == ["mute", "restore"])
-
-    def test_no_mute_without_the_tick(self):
-        audio_share.save_audio(self.settings_path, "send", "p1")
-        self.share.start()
-        wait_until(lambda: self.share.status == "Sending this PC's sound")
-        self.share.stop()
-        self.assertEqual(self.events, [])
-
-    def test_stop_restores_the_speakers(self):
-        audio_share.save_audio(self.settings_path, "send", "p1", mute_local=True)
-        self.share.start()
-        wait_until(lambda: self.events == ["mute"])
-        self.share.stop()
-        self.assertEqual(self.events, ["mute", "restore"])
-
-
-class TwoWayTests(unittest.TestCase):
-    """A machine can send its own sound and play another PC's at the same time."""
-
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.settings_path = Path(self.temp_dir.name) / "settings.json"
-        self.fake_module = FakePyAudioModule()
-        self.fake_module.loopbacks = [
-            {"index": 5, "name": "CABLE Input (VB-Audio Virtual Cable) [Loopback]", "defaultSampleRate": 44100, "maxInputChannels": 2}]
-        self._orig_pyaudio = audio_share._pyaudio
-        audio_share._pyaudio = lambda: self.fake_module
-        FakePyAudioInstance.get_loopback_device_info_generator = lambda inst: iter(inst.module.loopbacks)
-        peer = {"id": "p1", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "127.0.0.1"}
-        self.settings_path.write_text(json.dumps({"peers": [peer]}), encoding="utf-8")
-        self.share = audio_share.AudioShare(self.settings_path)
-
-    def tearDown(self):
-        self.share.stop()
-        del FakePyAudioInstance.get_loopback_device_info_generator
-        audio_share._pyaudio = self._orig_pyaudio
-        self.temp_dir.cleanup()
-
-    def choice(self, source="", output="Headphones"):
-        return {"send": {"on": True, "peer": "p1", "source": source, "mute_local": False},
-                "receive": {"on": True, "peer": "", "output": output}}
-
-    def test_sending_and_receiving_run_together(self):
-        audio_share.save_choice(self.settings_path, self.choice(source="CABLE Input", output="Headphones"))
-        self.share.start()
-        wait_until(lambda: self.share.send_status == "Sending this PC's sound")
-        wait_until(lambda: self.share.receive_status == "Waiting for sound")
-        self.assertIn("Sending this PC's sound", self.share.status)
-        self.assertIn("Waiting for sound", self.share.status)
-
-    def test_the_named_device_is_the_one_tapped(self):
-        audio_share.save_choice(self.settings_path, self.choice(source="CABLE Input"))
-        self.share.start()
-        wait_until(lambda: self.share.send_status == "Sending this PC's sound")
-        stream = self.fake_module.all_opened_streams[0]
-        self.assertEqual(stream.kwargs["input_device_index"], 5)
-        self.assertEqual(stream.kwargs["rate"], 44100)
-
-    def test_an_unknown_source_device_is_reported_not_guessed(self):
-        audio_share.save_choice(self.settings_path, self.choice(source="Nothing Like This"))
-        self.share.start()
-        wait_until(lambda: "not found" in self.share.send_status)
-
-    def test_sending_what_is_played_here_is_refused_to_avoid_an_echo(self):
-        audio_share.save_choice(self.settings_path, self.choice(source="Headphones", output="Headphones"))
-        self.share.start()
-        wait_until(lambda: self.share.send_status.startswith("Send and play on different devices"))
-        self.assertEqual(self.share.receive_status, "Waiting for sound")
-        self.assertEqual(self.fake_module.all_opened_streams, [])
-
-    def test_the_default_on_both_sides_is_the_same_device(self):
-        audio_share.save_choice(self.settings_path, self.choice(source="", output=""))
-        self.share.start()
-        wait_until(lambda: self.share.send_status.startswith("Send and play on different devices"))
-
-    def test_mute_is_ignored_when_a_named_device_is_sent(self):
-        events = []
-
-        class FakeMute:
-            def mute(self):
-                events.append("mute")
-                return True
-
-            def restore(self):
-                events.append("restore")
-                return True
-
-        original = audio_share.audio_mute.SpeakerMute
-        audio_share.audio_mute.SpeakerMute = FakeMute
-        self.addCleanup(setattr, audio_share.audio_mute, "SpeakerMute", original)
-        choice = self.choice(source="CABLE Input", output="Headphones")
-        choice["send"]["mute_local"] = True
-        audio_share.save_choice(self.settings_path, choice)
-        self.share.start()
-        wait_until(lambda: self.share.send_status == "Sending this PC's sound")
-        self.assertEqual(events, [])
-
-
-class AudioPageTests(unittest.TestCase):
+class AudioPageTests(ShareCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication(["test"])
 
     def setUp(self):
+        super().setUp()
         from PySide6.QtWidgets import QVBoxLayout, QWidget
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.settings_path = Path(self.temp_dir.name) / "settings.json"
-        self.fake_module = FakePyAudioModule()
-        self._orig_pyaudio = audio_share._pyaudio
-        audio_share._pyaudio = lambda: self.fake_module
-        peers = [{"id": "p1", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "192.168.1.10"},
-                 {"id": "p2", "name": "Desk", "platform": "windows", "token": TOKEN_B, "host": "192.168.1.20"}]
-        self.settings_path.write_text(json.dumps({"peers": peers}), encoding="utf-8")
-        self.share = audio_share.AudioShare(self.settings_path)
         self.host = QWidget()
         self.panel = audio_page.AudioPanel(self.share, QVBoxLayout(self.host), self.host)
 
     def tearDown(self):
         self.panel._timer.stop()
         self.host.close()
-        audio_share._pyaudio = self._orig_pyaudio
-        self.temp_dir.cleanup()
+        super().tearDown()
 
-    def test_it_starts_with_everything_off_and_lists_the_peers_and_devices(self):
+    def test_it_starts_off_with_a_card_for_each_paired_windows_pc(self):
         self.assertFalse(self.panel.send_on.isChecked() or self.panel.receive_on.isChecked())
-        self.assertEqual(self.panel.send_peer.count(), 2)
-        self.assertEqual(self.panel.receive_peer.count(), 3)  # any, then the two peers
-        self.assertEqual(self.panel.send_source.count(), 3)  # default, then the two fake devices
-        self.assertEqual(self.panel.receive_output.count(), 3)
+        self.assertEqual(set(self.panel._cards), {"pa", "pb"})
 
-    def test_each_change_is_saved_for_both_sides(self):
+    def test_pcs_that_cannot_carry_audio_get_no_card(self):
+        mac = dict(PEER_A, id="pm", platform="macos")
+        typed = dict(PEER_A, id="pt", token="typed by hand")
+        self.settings_path.write_text(json.dumps({"peers": [PEER_A, mac, typed]}), encoding="utf-8")
+        self.panel.refresh()
+        self.assertEqual(set(self.panel._cards), {"pa"})
+        self.assertFalse(self.panel.empty.isHidden() and False)
+
+    def test_the_switches_are_saved(self):
         self.panel.send_on.setChecked(True)
-        self.panel.send_peer.setCurrentIndex(1)
-        self.panel.send_source.setCurrentIndex(2)
-        self.panel.send_source.activated.emit(2)
         self.panel.receive_on.setChecked(True)
-        self.panel.receive_output.setCurrentIndex(1)
-        self.panel.receive_output.activated.emit(1)
         saved = audio_share.load_audio(self.settings_path)
-        self.assertEqual(saved["send"], {"on": True, "peer": "p2", "source": "Headphones", "mute_local": False})
-        self.assertEqual(saved["receive"], {"on": True, "peer": "", "output": "Default Speakers"})
-
-    def test_mute_only_applies_to_the_default_speakers(self):
-        self.assertTrue(self.panel.mute.isEnabled())
-        self.panel.send_source.setCurrentIndex(1)
-        self.panel.send_source.activated.emit(1)
-        self.assertFalse(self.panel.mute.isEnabled())
+        self.assertTrue(saved["send"] and saved["receive"])
 
     def test_the_saved_choice_is_shown_again(self):
-        audio_share.save_choice(self.settings_path, {
-            "send": {"on": True, "peer": "p2", "source": "Headphones", "mute_local": False},
-            "receive": {"on": True, "peer": "p1", "output": "Default Speakers"}})
+        self.choose(send=True, volumes={"pb": 40})
+        self.share.volumes.clear()
         self.panel.refresh()
-        self.assertTrue(self.panel.send_on.isChecked() and self.panel.receive_on.isChecked())
-        self.assertEqual(self.panel.send_peer.currentData(), "p2")
-        self.assertEqual(self.panel.send_source.currentData(), "Headphones")
-        self.assertEqual(self.panel.receive_peer.currentData(), "p1")
+        self.assertTrue(self.panel.send_on.isChecked())
+        self.assertFalse(self.panel.receive_on.isChecked())
+        self.assertEqual(self.panel._cards["pb"].slider.value(), 40)
+
+    def test_a_slider_changes_the_volume_at_once_and_is_saved(self):
+        self.panel._cards["pa"].slider.setValue(70)
+        self.assertEqual(self.share.volumes["pa"], 70)
+        self.panel._save()
+        self.assertEqual(audio_share.load_audio(self.settings_path)["volumes"]["pa"], 70)
+
+    def test_mute_goes_to_zero_and_back_to_where_it_was(self):
+        card = self.panel._cards["pa"]
+        card.slider.setValue(60)
+        card.mute.setChecked(True)
+        self.assertEqual((card.slider.value(), self.share.volumes["pa"]), (0, 0))
+        card.mute.setChecked(False)
+        self.assertEqual(card.slider.value(), 60)
+
+    def test_moving_the_slider_off_zero_unmutes(self):
+        card = self.panel._cards["pa"]
+        card.mute.setChecked(True)
+        card.slider.setValue(20)
+        self.assertFalse(card.mute.isChecked())
+
+    def test_the_cards_follow_what_is_heard(self):
+        card = self.panel._cards["pa"]
+        self.panel._tick()
+        self.assertEqual(card.state.text(), "Hearing is off")
+        self.panel.receive_on.setChecked(True)
+        self.share.sources = {"pa": {"name": "Laptop", "playing": True, "level": 0.5}}
+        self.panel._tick()
+        self.assertEqual(card.state.text(), "Streaming")
+        self.assertGreater(card.meter.level, 0.4)
+        self.share.sources = {"pa": {"name": "Laptop", "playing": False, "level": 0.0}}
+        self.panel._tick()
+        self.assertEqual(card.state.text(), "Quiet")
 
     def test_the_status_lines_follow_the_share(self):
-        self.share.send_status = "Sending this PC's sound"
-        self.share.receive_status = "Playing sound from Laptop"
+        self.share.send_status = "Streaming this PC's sound to 2 PCs"
+        self.share.receive_status = "Playing from Laptop"
         self.panel._tick()
-        self.assertEqual(self.panel.send_status.text(), "Sending this PC's sound")
-        self.assertEqual(self.panel.receive_status.text(), "Playing sound from Laptop")
+        self.assertEqual(self.panel.send_status.text(), "Streaming this PC's sound to 2 PCs")
+        self.assertEqual(self.panel.receive_status.text(), "Playing from Laptop")
 
     def test_without_a_share_the_page_only_says_it_is_for_windows(self):
         from PySide6.QtWidgets import QVBoxLayout, QWidget

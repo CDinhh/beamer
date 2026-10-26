@@ -1,15 +1,15 @@
-"""Audio sharing between paired Windows machines: one machine sends what its speakers play, the
-other plays it on its own speakers.
+"""Audio sharing between paired Windows machines: each machine can stream what it plays to all the
+others, and play, mixed together, what the others stream.
 
 Kept apart from the input link on purpose: its own UDP port, its own file (audio.json beside
 settings.json), and the pairing tokens read from settings.json, never written. Each datagram is
 sealed with a key derived from the pair's token, so only a paired machine is heard.
 
-A machine is in one mode: "off", "send" (its sound goes to one peer) or "receive" (it plays a
-peer's sound). Never both: a machine that plays a peer's sound and sends its own would echo it
-back for ever, since the sender captures whatever its speakers play.
+Beamer plays what it receives itself, one stream per source machine, so Windows mixes them, and
+each source has its own volume. What a machine streams leaves Beamer's own sound out (see
+audio_loopback), otherwise the sound it plays for others would be sent straight back to them.
 
-Needs PyAudioWPatch (WASAPI loopback). Without it the feature reports why and stays off.
+Needs PyAudioWPatch (to play). Without it the feature reports why and stays off.
 """
 
 import json
@@ -19,25 +19,33 @@ import socket
 import struct
 import threading
 import time
+import warnings
 from array import array
 from pathlib import Path
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    try:
+        import audioop  # removed in Python 3.13, where the audioop-lts package provides it
+    except ImportError:
+        audioop = None
 
 from nacl.exceptions import CryptoError
 from nacl.secret import SecretBox
 from nacl.utils import random as random_bytes
 
-import audio_mute
+import audio_loopback
 from core import protocol
 
 LOGGER = logging.getLogger("beamer.audio")
 
 PORT = 24822
-MODES = ("off", "send", "receive")
 FILE_NAME = "audio.json"
 
 # 5 ms of 16-bit stereo at 48 kHz is 960 bytes: with the 56 bytes of sealing it fits one Ethernet
 # frame with room to spare, so nothing is fragmented.
 CHUNK_DIVISOR = 200
+SLICE_BYTES = 960
 KEY_ID_SIZE = 16
 NONCE_SIZE = SecretBox.NONCE_SIZE
 HEADER = struct.Struct(">IIII")  # session, sequence, sample rate, chunk length in bytes
@@ -46,7 +54,9 @@ MAX_DATAGRAM = 4096
 PRIME_MS = 40  # buffered before playing starts, to ride out network jitter
 MAX_MS = 200  # buffered at most; older audio is dropped so a stall never becomes lag
 REFRESH_SECONDS = 5.0
-IDLE_SECONDS = 1.5  # a source silent this long frees the speakers for another
+IDLE_SECONDS = 1.5  # a source silent this long is shown as quiet and its speakers are freed
+DEFAULT_VOLUME = 100
+MAX_VOLUME = 150  # percent
 
 
 def audio_key(token: str) -> bytes:
@@ -92,30 +102,47 @@ def to_stereo(data: bytes, channels: int) -> bytes:
     return out.tobytes()
 
 
+def scaled(pcm: bytes, percent: int) -> bytes:
+    """16-bit PCM at `percent` of its volume, clipped rather than wrapped."""
+    if percent == 100:
+        return pcm
+    if audioop is not None:
+        return audioop.mul(pcm, 2, percent / 100)
+    samples = array("h")
+    samples.frombytes(pcm)
+    factor = percent / 100
+    return array("h", (max(-32768, min(32767, int(v * factor))) for v in samples)).tobytes()
+
+
+def peak(pcm: bytes) -> float:
+    """The loudest sample of 16-bit PCM, 0 to 1."""
+    if audioop is not None:
+        return audioop.max(pcm, 2) / 32768
+    samples = array("h")
+    samples.frombytes(pcm)
+    return max((abs(v) for v in samples), default=0) / 32768
+
+
 def settings_dir(settings_path) -> Path:
     return Path(settings_path).parent
 
 
-def _text(value) -> str:
-    return value if isinstance(value, str) else ""
-
-
 def load_audio(settings_path) -> dict:
     """The saved choice, forgiving of a missing or damaged file: a machine starts with audio off.
-    Sending and playing are separate, so a machine can do both: its own sound to one PC and another
-    PC's sound on a different device."""
+    `volumes` is each source machine's volume in percent, by machine id."""
     try:
         raw = json.loads((settings_dir(settings_path) / FILE_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raw = {}
     raw = raw if isinstance(raw, dict) else {}
-    send, receive = (raw[k] if isinstance(raw.get(k), dict) else {} for k in ("send", "receive"))
+    volumes = raw.get("volumes") if isinstance(raw.get("volumes"), dict) else {}
     return {
-        "send": {
-            "on": send.get("on") is True, "peer": _text(send.get("peer")), "source": _text(send.get("source")),
-            "mute_local": send.get("mute_local") is True,
+        "send": raw.get("send") is True,
+        "receive": raw.get("receive") is True,
+        "volumes": {
+            str(key): max(0, min(MAX_VOLUME, int(value))) for key, value in volumes.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
         },
-        "receive": {"on": receive.get("on") is True, "peer": _text(receive.get("peer")), "output": _text(receive.get("output"))},
     }
 
 
@@ -124,16 +151,6 @@ def save_choice(settings_path, choice: dict) -> None:
     temporary = target.with_name(FILE_NAME + ".tmp")
     temporary.write_text(json.dumps(choice), encoding="utf-8")
     os.replace(temporary, target)
-
-
-def save_audio(settings_path, mode: str, peer: str = "", output: str = "", mute_local: bool = False) -> None:
-    """Shorthand for one side on and the other off; the window saves both with save_choice."""
-    if mode not in MODES:
-        raise ValueError(mode)
-    save_choice(settings_path, {
-        "send": {"on": mode == "send", "peer": peer if mode == "send" else "", "source": "", "mute_local": bool(mute_local)},
-        "receive": {"on": mode == "receive", "peer": peer if mode == "receive" else "", "output": output},
-    })
 
 
 def paired_peers(settings_path) -> list:
@@ -166,43 +183,10 @@ def _pyaudio():
     return pyaudiowpatch
 
 
-def output_devices() -> list:
-    """Names of the speakers this machine can play on, for the choice lists."""
-    pa = _pyaudio()
-    player = pa.PyAudio()
-    try:
-        wasapi = player.get_host_api_info_by_type(pa.paWASAPI)["index"]
-        return sorted({
-            info["name"] for info in (player.get_device_info_by_index(i) for i in range(player.get_device_count()))
-            if info["hostApi"] == wasapi and info["maxOutputChannels"] > 0
-        })
-    finally:
-        player.terminate()
-
-
-def default_output_name() -> str:
-    pa = _pyaudio()
-    player = pa.PyAudio()
-    try:
-        return player.get_device_info_by_index(player.get_host_api_info_by_type(pa.paWASAPI)["defaultOutputDevice"])["name"]
-    finally:
-        player.terminate()
-
-
-def _loopback_of(player, source: str):
-    """The loopback tap of the named output device, or of the default one when no name is given."""
-    if not source:
-        return player.get_default_wasapi_loopback()
-    for info in player.get_loopback_device_info_generator():
-        if info["name"].startswith(source):
-            return info
-    raise RuntimeError("Sound device not found: " + source)
-
-
 class Player:
     """Plays 16-bit stereo PCM fed to it, with a small buffer that smooths out the network."""
 
-    def __init__(self, pa, rate: int, device_name: str):
+    def __init__(self, pa, rate: int):
         self.rate = rate
         self._buffer = bytearray()
         self._lock = threading.Lock()
@@ -211,24 +195,15 @@ class Player:
         self._pa = pa.PyAudio()
         self._stream = None
         try:
-            self._stream = self._open(pa, device_name)
+            self._stream = self._open(pa)
         except Exception:
             self._pa.terminate()
             raise
 
-    def _device_index(self, pa, device_name: str):
-        wasapi = self._pa.get_host_api_info_by_type(pa.paWASAPI)
-        if device_name:
-            for i in range(self._pa.get_device_count()):
-                info = self._pa.get_device_info_by_index(i)
-                if info["hostApi"] == wasapi["index"] and info["name"] == device_name and info["maxOutputChannels"]:
-                    return i
-        return wasapi["defaultOutputDevice"]
-
-    def _open(self, pa, device_name):
-        index = self._device_index(pa, device_name)
-        # WASAPI shared mode only takes the device's own rate; if the sender's differs, the default
-        # host API (MME) lets Windows convert.
+    def _open(self, pa):
+        # The default output at the sender's rate. WASAPI shared mode only takes the device's own rate;
+        # if that differs, the default host API (MME) lets Windows convert.
+        index = self._pa.get_host_api_info_by_type(pa.paWASAPI)["defaultOutputDevice"]
         for device in (index, None):
             try:
                 return self._pa.open(
@@ -238,7 +213,6 @@ class Player:
                 if device is None:
                     raise
                 LOGGER.info("WASAPI would not play %d Hz stereo; trying the default device", self.rate)
-                index = None
 
     def _pull(self, _in_data, frames, _time_info, _status):
         need = frames * 4
@@ -268,8 +242,21 @@ class Player:
             self._pa.terminate()
 
 
+class _Source:
+    """One machine whose sound is playing here."""
+
+    def __init__(self, peer_id: str, name: str):
+        self.peer_id = peer_id
+        self.name = name
+        self.player = None
+        self.session = None
+        self.sequence = 0
+        self.heard = 0.0
+        self.level = 0.0
+
+
 class AudioShare:
-    """Runs the two sides the saved choice asks for, each on its own, and follows changes to it."""
+    """Runs the sending and receiving sides the saved choice asks for, and follows changes to it."""
 
     SIDES = ("send", "receive")
 
@@ -277,15 +264,21 @@ class AudioShare:
         self.settings_path = Path(settings_path)
         self.send_status = ""
         self.receive_status = ""
+        # peer id -> {"name", "playing", "level"} for the window; filled by the receiving thread.
+        self.sources = {}
+        self.volumes = {}
         self._wake = threading.Event()
         self._stopped = threading.Event()
         self._thread = None
+        # Streaming the plain mix of the speakers (no way to leave Beamer's own sound out) and whether this PC hears.
+        self._fallback = False
+        self._receiving = False
         self._applied = {side: None for side in self.SIDES}
         self._teardowns = {side: _nothing for side in self.SIDES}
 
     @property
     def status(self) -> str:
-        return " \u00b7 ".join(text for text in (self.send_status, self.receive_status) if text)
+        return " · ".join(text for text in (self.send_status, self.receive_status) if text)
 
     def start(self) -> None:
         if self._thread is None:
@@ -295,6 +288,10 @@ class AudioShare:
     def apply(self) -> None:
         """Pick up a changed choice now rather than at the next refresh."""
         self._wake.set()
+
+    def set_volume(self, peer_id: str, percent: int) -> None:
+        """A source's volume takes effect at once; the window saves it with save_choice."""
+        self.volumes[peer_id] = max(0, min(MAX_VOLUME, int(percent)))
 
     def stop(self) -> None:
         self._stopped.set()
@@ -313,25 +310,17 @@ class AudioShare:
     def _reconcile(self) -> None:
         choice = load_audio(self.settings_path)
         peers = paired_peers(self.settings_path)
-        send, receive = choice["send"], choice["receive"]
-        try:
-            # Playing on the device whose sound is sent would send it straight back: an echo for ever.
-            clash = send["on"] and receive["on"] and (
-                send["source"] or default_output_name()) == (receive["output"] or default_output_name())
-        except Exception:
-            clash = False
-        target = next((p for p in peers if p["id"] == send["peer"] and p["host"]), None)
-        if not send["on"]:
+        self.volumes.update({k: v for k, v in choice["volumes"].items() if k not in self.volumes})
+        targets = tuple((p["host"], p["token"]) for p in peers if p["host"])
+        self._receiving = choice["receive"]
+        if not choice["send"]:
             wanted_send = ("off",)
-        elif clash:
-            wanted_send = ("clash",)
-        elif target is None:
+        elif not targets:
             wanted_send = ("send-missing",)
         else:
-            wanted_send = ("send", target["host"], target["token"], send["mute_local"] and not send["source"], send["source"])
-        wanted_receive = (
-            ("receive", receive["peer"], receive["output"], tuple((p["id"], p["token"]) for p in peers))
-            if receive["on"] else ("off",))
+            # Whether Beamer is also hearing only matters when its own sound cannot be left out of the stream.
+            wanted_send = ("send", targets, choice["receive"] and self._fallback)
+        wanted_receive = ("receive", tuple((p["id"], p["token"]) for p in peers)) if choice["receive"] else ("off",)
         for side, wanted in (("send", wanted_send), ("receive", wanted_receive)):
             try:
                 self._apply_side(side, wanted, peers)
@@ -351,33 +340,55 @@ class AudioShare:
         status = ""
         kind = wanted[0]
         if kind == "send-missing":
-            status = "Choose a paired machine to send to"
-        elif kind == "clash":
-            status = "Send and play on different devices, or the sound loops back"
+            status = "Pair another Windows PC to stream to"
         elif kind == "send":
-            self._teardowns[side] = self._start_sending(*wanted[1:])
-            status = "Sending this PC's sound"
+            self._teardowns[side] = self._start_sending(wanted[1])
+            status = "Streaming this PC's sound to %d PC%s" % (len(wanted[1]), "" if len(wanted[1]) == 1 else "s")
         elif kind == "receive":
-            self._teardowns[side] = self._start_receiving(wanted[1], wanted[2], peers)
-            status = "Waiting for sound"
+            self._teardowns[side] = self._start_receiving(peers)
+            status = "Listening for other PCs"
         setattr(self, side + "_status", status)
 
-    def _start_sending(self, host: str, token: str, mute_local: bool = False, source: str = ""):
-        pa = _pyaudio()
-        player = pa.PyAudio()
+    def _start_sending(self, targets: tuple):
+        self._fallback = False
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         session = struct.unpack(">I", random_bytes(4))[0]
         sequence = [0]
+
+        def send_chunk(pcm: bytes, rate: int = audio_loopback.RATE) -> None:
+            for start in range(0, len(pcm), SLICE_BYTES):
+                piece = pcm[start:start + SLICE_BYTES]
+                sequence[0] = (sequence[0] + 1) & 0xFFFFFFFF
+                for host, token in targets:
+                    try:
+                        sock.sendto(seal(token, session, sequence[0], rate, piece), (host, PORT))
+                    except OSError:
+                        pass  # that PC is away or the network is down; the next slice tries again
+
+        capture = audio_loopback.LoopbackCapture(send_chunk) if audio_loopback.available() else None
         try:
-            loopback = _loopback_of(player, source)
+            if capture is not None:
+                capture.start()
+                return lambda: (capture.stop(), sock.close())
+        except Exception as error:
+            LOGGER.warning("Could not leave Beamer's own sound out of the stream: %s", error)
+        if self._receiving:
+            sock.close()
+            raise RuntimeError(
+                "This Windows cannot leave Beamer's own sound out of what it streams. Turn off Hear other PCs to stream.")
+        self._fallback = True
+        return self._start_plain_loopback(sock, send_chunk)
+
+    def _start_plain_loopback(self, sock, send_chunk):
+        """The whole mix of the default speakers, for a Windows that cannot leave Beamer out."""
+        pa = _pyaudio()
+        player = pa.PyAudio()
+        try:
+            loopback = player.get_default_wasapi_loopback()
             rate, channels = int(loopback["defaultSampleRate"]), int(loopback["maxInputChannels"])
 
             def push(data, _frames, _time_info, _status):
-                sequence[0] = (sequence[0] + 1) & 0xFFFFFFFF
-                try:
-                    sock.sendto(seal(token, session, sequence[0], rate, to_stereo(data, channels)), (host, PORT))
-                except OSError:
-                    pass  # the peer is away or the network is down; the next chunk tries again
+                send_chunk(to_stereo(data, channels), rate)
                 return None, pa.paContinue
 
             stream = player.open(
@@ -388,26 +399,18 @@ class AudioShare:
             player.terminate()
             raise
 
-        muter = None
-        if mute_local:
-            muter = audio_mute.SpeakerMute()
-            if not muter.mute():
-                LOGGER.warning("Could not mute this PC's speakers; they keep playing while sending")
-
         def teardown():
             try:
                 stream.stop_stream()
                 stream.close()
                 player.terminate()
-                sock.close()
             finally:
-                if muter is not None:
-                    muter.restore()
+                sock.close()
 
         return teardown
 
-    def _start_receiving(self, peer_id: str, output: str, peers: list):
-        accepted = {audio_key_id(p["token"]): p for p in peers if not peer_id or p["id"] == peer_id}
+    def _start_receiving(self, peers: list):
+        accepted = {audio_key_id(p["token"]): p for p in peers}
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.bind(("", PORT))
@@ -417,47 +420,55 @@ class AudioShare:
         sock.settimeout(0.5)
         stop = threading.Event()
         pa = _pyaudio()
+        self.sources = {p["id"]: {"name": p["name"], "playing": False, "level": 0.0} for p in peers}
 
         def listen():
-            player = source = None  # source: (peer id, session, last sequence, last heard)
+            heard = {}  # peer id -> _Source
             try:
                 while not stop.is_set():
                     try:
                         datagram = sock.recv(MAX_DATAGRAM)
                     except socket.timeout:
-                        if player is not None and time.monotonic() - source[3] > IDLE_SECONDS:
-                            player.close()
-                            player = source = None
-                            self.receive_status = "Waiting for sound"
-                        continue
+                        datagram = None
                     except OSError as error:
                         if stop.is_set() or getattr(error, "winerror", 0) not in (10040, 10054):
                             break
                         continue  # an oversize datagram or an ICMP reset: drop it, keep listening
+                    now = time.monotonic()
+                    for source in list(heard.values()):
+                        if now - source.heard > IDLE_SECONDS and source.player is not None:
+                            source.player.close()
+                            source.player = None
+                            source.level = 0.0
+                            self._publish(heard)
+                    if datagram is None:
+                        continue
                     peer = accepted.get(datagram[:KEY_ID_SIZE])
                     opened = unseal(peer["token"], datagram) if peer else None
                     if opened is None:
                         continue
                     session, sequence, rate, pcm = opened
-                    now = time.monotonic()
-                    if source is not None and source[0] != peer["id"] and now - source[3] < IDLE_SECONDS:
-                        continue  # the speakers are taken by another machine
-                    if source is not None and source[0] == peer["id"] and source[1] == session and sequence <= source[2]:
+                    source = heard.setdefault(peer["id"], _Source(peer["id"], peer["name"]))
+                    if source.player is not None and source.session == session and sequence <= source.sequence:
                         continue  # a repeat or a late datagram
-                    if player is None or player.rate != rate:
-                        if player is not None:
-                            player.close()
-                            player = None
-                        player = Player(pa, rate, output)
-                    self.receive_status = "Playing sound from " + peer["name"]
-                    source = (peer["id"], session, sequence, now)
-                    player.feed(pcm)
+                    if source.player is None or source.player.rate != rate:
+                        if source.player is not None:
+                            source.player.close()
+                            source.player = None
+                        source.player = Player(pa, rate)
+                    source.session, source.sequence, source.heard = session, sequence, now
+                    source.level = peak(pcm)
+                    percent = self.volumes.get(peer["id"], DEFAULT_VOLUME)
+                    if percent:
+                        source.player.feed(scaled(pcm, percent))
+                    self._publish(heard)
             except Exception as error:
                 LOGGER.exception("Audio playback failed")
                 self.receive_status = "Could not play sound: " + (str(error) or error.__class__.__name__)
             finally:
-                if player is not None:
-                    player.close()
+                for source in heard.values():
+                    if source.player is not None:
+                        source.player.close()
 
         worker = threading.Thread(target=listen, name="beamer-audio-in", daemon=True)
         worker.start()
@@ -466,5 +477,15 @@ class AudioShare:
             stop.set()
             sock.close()
             worker.join(3)
+            self.sources = {}
 
         return teardown
+
+    def _publish(self, heard: dict) -> None:
+        """What the window shows: who is playing, and how loud each is."""
+        sources = {peer_id: dict(info, playing=False, level=0.0) for peer_id, info in self.sources.items()}
+        for peer_id, source in heard.items():
+            sources[peer_id] = {"name": source.name, "playing": source.player is not None, "level": source.level}
+        self.sources = sources
+        names = [info["name"] for info in sources.values() if info["playing"]]
+        self.receive_status = "Playing from " + ", ".join(names) if names else "Listening for other PCs"

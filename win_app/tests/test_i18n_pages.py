@@ -54,10 +54,6 @@ class LocalisedPages(unittest.TestCase):
     def setUp(self):
         os.environ["BEAMER_LANGUAGE"] = "qps"
         i18n.install("auto")
-        # The Audio page lists this machine's own sound devices, which are data and not for translating.
-        devices = mock.patch("audio_share.output_devices", return_value=[])
-        devices.start()
-        self.addCleanup(devices.stop)
         self.folder = tempfile.TemporaryDirectory(prefix="beamer-i18n-")
         settings = app_config.migrate(None, machine_id=protocol.id_text(responder_harness.HERE))
         settings.update(port=49152, appearance="dark", check_updates=False)
