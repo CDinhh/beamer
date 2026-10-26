@@ -53,15 +53,23 @@ class FileTests(unittest.TestCase):
         self.dir.cleanup()
 
     def test_a_missing_or_damaged_file_means_off(self):
-        self.assertEqual(audio_share.load_audio(self.settings)["mode"], "off")
+        self.assertFalse(audio_share.load_audio(self.settings)["send"]["on"] or audio_share.load_audio(self.settings)["receive"]["on"])
         (Path(self.dir.name) / audio_share.FILE_NAME).write_text("[1", encoding="utf-8")
-        self.assertEqual(audio_share.load_audio(self.settings)["mode"], "off")
+        self.assertFalse(audio_share.load_audio(self.settings)["send"]["on"] or audio_share.load_audio(self.settings)["receive"]["on"])
 
     def test_a_saved_choice_comes_back(self):
         audio_share.save_audio(self.settings, "receive", "abc", "Speakers")
-        self.assertEqual(audio_share.load_audio(self.settings), {"mode": "receive", "peer": "abc", "output": "Speakers", "mute_local": False})
+        saved = audio_share.load_audio(self.settings)
+        self.assertEqual(saved["receive"], {"on": True, "peer": "abc", "output": "Speakers"})
+        self.assertFalse(saved["send"]["on"])
         with self.assertRaises(ValueError):
             audio_share.save_audio(self.settings, "both")
+
+    def test_both_sides_can_be_on_at_once(self):
+        choice = {"send": {"on": True, "peer": "a", "source": "CABLE Input", "mute_local": False},
+                  "receive": {"on": True, "peer": "", "output": "Speakers"}}
+        audio_share.save_choice(self.settings, choice)
+        self.assertEqual(audio_share.load_audio(self.settings), choice)
 
     def test_only_windows_peers_paired_by_code_can_carry_audio(self):
         good = {"id": "aaa", "name": "Laptop", "platform": "windows", "token": TOKEN, "host": "192.168.1.5"}

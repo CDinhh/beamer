@@ -1,5 +1,5 @@
 """Integration tests for audio sharing: Player buffering, AudioShare networking,
-Manager lifecycle and AudioDialog UI. Uses fakes for PyAudioWPatch.
+Manager lifecycle and the Audio page. Uses fakes for PyAudioWPatch.
 """
 
 import json
@@ -22,8 +22,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-import audio_dialog
+import audio_page
 import audio_share
+
+# A port of its own, so the tests never meet a Beamer that is running on this machine.
+audio_share.PORT = 24899
 from core import protocol
 
 # Valid 43-char base64 paired tokens (from 32 bytes)
@@ -786,7 +789,7 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(stream1.is_stopped)
         self.assertTrue(stream1.is_closed)
         self.assertFalse(stream2.is_stopped)
-        self.assertEqual(self.share._applied, ("send", "127.0.0.2", TOKEN_A, False))
+        self.assertEqual(self.share._applied["send"], ("send", "127.0.0.2", TOKEN_A, False, ""))
 
     def test_exceptions_set_status_and_do_not_kill_thread(self):
         """An unhandled error in reconcile sets self.status and leaves the worker thread alive."""
@@ -821,167 +824,6 @@ class ManagerTests(unittest.TestCase):
         # Idempotent calls
         self.share.stop()
         self.share.stop()
-
-
-# ---------------------------------------------------------------------------
-# AudioDialog Tests (Qt Offscreen)
-# ---------------------------------------------------------------------------
-
-class AudioDialogTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication(["test"])
-
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.settings_path = Path(self.temp_dir.name) / "settings.json"
-        self.fake_module = FakePyAudioModule()
-        self._orig_pyaudio = audio_share._pyaudio
-        audio_share._pyaudio = lambda: self.fake_module
-
-        self.peer1 = {"id": "p1", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "192.168.1.10"}
-        self.peer2 = {"id": "p2", "name": "Desk", "platform": "windows", "token": TOKEN_B, "host": "192.168.1.20"}
-        self.settings_path.write_text(json.dumps({"peers": [self.peer1, self.peer2]}), encoding="utf-8")
-
-        self.share = audio_share.AudioShare(self.settings_path)
-
-    def tearDown(self):
-        self.share.stop()
-        audio_share._pyaudio = self._orig_pyaudio
-        self.temp_dir.cleanup()
-
-    def test_dialog_loads_saved_choice_off(self):
-        """AudioDialog selects 'off' radio button when saved mode is off."""
-        audio_share.save_audio(self.settings_path, "off")
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        self.assertTrue(dlg.off.isChecked())
-        self.assertFalse(dlg.send.isChecked())
-        self.assertFalse(dlg.receive.isChecked())
-
-    def test_dialog_loads_saved_choice_send(self):
-        """AudioDialog selects 'send' and preselects the saved target peer."""
-        audio_share.save_audio(self.settings_path, "send", peer="p2")
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        self.assertTrue(dlg.send.isChecked())
-        self.assertEqual(dlg.target.currentData(), "p2")
-
-    def test_dialog_loads_saved_choice_receive(self):
-        """AudioDialog selects 'receive' and preselects source peer and output device."""
-        audio_share.save_audio(self.settings_path, "receive", peer="p1", output="Headphones")
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        self.assertTrue(dlg.receive.isChecked())
-        self.assertEqual(dlg.source.currentData(), "p1")
-        self.assertEqual(dlg.output.currentData(), "Headphones")
-
-    def test_dialog_enable_toggles(self):
-        """Toggling radio buttons enables/disables target, source, and output controls."""
-        audio_share.save_audio(self.settings_path, "off")
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        # Off mode
-        self.assertFalse(dlg.target.isEnabled())
-        self.assertFalse(dlg.source.isEnabled())
-        self.assertFalse(dlg.output.isEnabled())
-
-        # Send mode
-        dlg.send.setChecked(True)
-        self.assertTrue(dlg.target.isEnabled())
-        self.assertFalse(dlg.source.isEnabled())
-        self.assertFalse(dlg.output.isEnabled())
-
-        # Receive mode
-        dlg.receive.setChecked(True)
-        self.assertFalse(dlg.target.isEnabled())
-        self.assertTrue(dlg.source.isEnabled())
-        self.assertTrue(dlg.output.isEnabled())
-
-        # Off mode again
-        dlg.off.setChecked(True)
-        self.assertFalse(dlg.target.isEnabled())
-        self.assertFalse(dlg.source.isEnabled())
-        self.assertFalse(dlg.output.isEnabled())
-
-    def test_dialog_save_writes_off(self):
-        """_save() writes mode 'off' when off is checked."""
-        audio_share.save_audio(self.settings_path, "send", peer="p1")
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        dlg.off.setChecked(True)
-        dlg._save()
-
-        saved = audio_share.load_audio(self.settings_path)
-        self.assertEqual(saved, {"mode": "off", "peer": "", "output": "", "mute_local": False})
-
-    def test_dialog_save_writes_send(self):
-        """_save() writes mode 'send' and the selected peer id."""
-        audio_share.save_audio(self.settings_path, "off")
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        dlg.send.setChecked(True)
-        index = dlg.target.findData("p2")
-        dlg.target.setCurrentIndex(index)
-        dlg._save()
-
-        saved = audio_share.load_audio(self.settings_path)
-        self.assertEqual(saved, {"mode": "send", "peer": "p2", "output": "", "mute_local": False})
-
-    def test_dialog_save_writes_receive(self):
-        """_save() writes mode 'receive', source peer, and output device."""
-        audio_share.save_audio(self.settings_path, "off")
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        dlg.receive.setChecked(True)
-        dlg.source.setCurrentIndex(dlg.source.findData("p1"))
-        dlg.output.setCurrentIndex(dlg.output.findData("Headphones"))
-        dlg._save()
-
-        saved = audio_share.load_audio(self.settings_path)
-        self.assertEqual(saved, {"mode": "receive", "peer": "p1", "output": "Headphones", "mute_local": False})
-
-    def test_dialog_empty_peer_list(self):
-        """AudioDialog behaves cleanly when no peers are paired."""
-        self.settings_path.write_text(json.dumps({"peers": []}), encoding="utf-8")
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        self.assertEqual(len(dlg.peers), 0)
-        dlg.send.setChecked(True)
-        # Target disabled because peers list is empty
-        self.assertFalse(dlg.target.isEnabled())
-
-        # Source has default "Any paired PC"
-        self.assertEqual(dlg.source.count(), 1)
-        self.assertEqual(dlg.source.currentData(), "")
-
-        # Save send with no peers selected saves peer as empty string
-        dlg._save()
-        saved = audio_share.load_audio(self.settings_path)
-        self.assertEqual(saved, {"mode": "send", "peer": "", "output": "", "mute_local": False})
-
-    def test_dialog_status_timer_updates(self):
-        """Timer callback updates dialog status label when share status changes."""
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-
-        self.share.status = "Playing sound from Laptop"
-        dlg._tick.timeout.emit()
-        self.assertEqual(dlg.status.text(), "Playing sound from Laptop")
-
-        self.share.status = ""
-        dlg._tick.timeout.emit()
-        self.assertEqual(dlg.status.text(), "")
-
-
 
 
 class MuteLocalTests(unittest.TestCase):
@@ -1039,15 +881,160 @@ class MuteLocalTests(unittest.TestCase):
         self.share.stop()
         self.assertEqual(self.events, ["mute", "restore"])
 
-    def test_dialog_saves_the_tick(self):
-        from PySide6.QtWidgets import QApplication
-        QApplication.instance() or QApplication([])
-        dlg = audio_dialog.AudioDialog(self.share)
-        self.addCleanup(dlg.close)
-        dlg.send.setChecked(True)
-        dlg.mute.setChecked(True)
-        dlg._save()
-        self.assertTrue(audio_share.load_audio(self.settings_path)["mute_local"])
+
+class TwoWayTests(unittest.TestCase):
+    """A machine can send its own sound and play another PC's at the same time."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.settings_path = Path(self.temp_dir.name) / "settings.json"
+        self.fake_module = FakePyAudioModule()
+        self.fake_module.loopbacks = [
+            {"index": 5, "name": "CABLE Input (VB-Audio Virtual Cable) [Loopback]", "defaultSampleRate": 44100, "maxInputChannels": 2}]
+        self._orig_pyaudio = audio_share._pyaudio
+        audio_share._pyaudio = lambda: self.fake_module
+        FakePyAudioInstance.get_loopback_device_info_generator = lambda inst: iter(inst.module.loopbacks)
+        peer = {"id": "p1", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "127.0.0.1"}
+        self.settings_path.write_text(json.dumps({"peers": [peer]}), encoding="utf-8")
+        self.share = audio_share.AudioShare(self.settings_path)
+
+    def tearDown(self):
+        self.share.stop()
+        del FakePyAudioInstance.get_loopback_device_info_generator
+        audio_share._pyaudio = self._orig_pyaudio
+        self.temp_dir.cleanup()
+
+    def choice(self, source="", output="Headphones"):
+        return {"send": {"on": True, "peer": "p1", "source": source, "mute_local": False},
+                "receive": {"on": True, "peer": "", "output": output}}
+
+    def test_sending_and_receiving_run_together(self):
+        audio_share.save_choice(self.settings_path, self.choice(source="CABLE Input", output="Headphones"))
+        self.share.start()
+        wait_until(lambda: self.share.send_status == "Sending this PC's sound")
+        wait_until(lambda: self.share.receive_status == "Waiting for sound")
+        self.assertIn("Sending this PC's sound", self.share.status)
+        self.assertIn("Waiting for sound", self.share.status)
+
+    def test_the_named_device_is_the_one_tapped(self):
+        audio_share.save_choice(self.settings_path, self.choice(source="CABLE Input"))
+        self.share.start()
+        wait_until(lambda: self.share.send_status == "Sending this PC's sound")
+        stream = self.fake_module.all_opened_streams[0]
+        self.assertEqual(stream.kwargs["input_device_index"], 5)
+        self.assertEqual(stream.kwargs["rate"], 44100)
+
+    def test_an_unknown_source_device_is_reported_not_guessed(self):
+        audio_share.save_choice(self.settings_path, self.choice(source="Nothing Like This"))
+        self.share.start()
+        wait_until(lambda: "not found" in self.share.send_status)
+
+    def test_sending_what_is_played_here_is_refused_to_avoid_an_echo(self):
+        audio_share.save_choice(self.settings_path, self.choice(source="Headphones", output="Headphones"))
+        self.share.start()
+        wait_until(lambda: self.share.send_status.startswith("Send and play on different devices"))
+        self.assertEqual(self.share.receive_status, "Waiting for sound")
+        self.assertEqual(self.fake_module.all_opened_streams, [])
+
+    def test_the_default_on_both_sides_is_the_same_device(self):
+        audio_share.save_choice(self.settings_path, self.choice(source="", output=""))
+        self.share.start()
+        wait_until(lambda: self.share.send_status.startswith("Send and play on different devices"))
+
+    def test_mute_is_ignored_when_a_named_device_is_sent(self):
+        events = []
+
+        class FakeMute:
+            def mute(self):
+                events.append("mute")
+                return True
+
+            def restore(self):
+                events.append("restore")
+                return True
+
+        original = audio_share.audio_mute.SpeakerMute
+        audio_share.audio_mute.SpeakerMute = FakeMute
+        self.addCleanup(setattr, audio_share.audio_mute, "SpeakerMute", original)
+        choice = self.choice(source="CABLE Input", output="Headphones")
+        choice["send"]["mute_local"] = True
+        audio_share.save_choice(self.settings_path, choice)
+        self.share.start()
+        wait_until(lambda: self.share.send_status == "Sending this PC's sound")
+        self.assertEqual(events, [])
+
+
+class AudioPageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication(["test"])
+
+    def setUp(self):
+        from PySide6.QtWidgets import QVBoxLayout, QWidget
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.settings_path = Path(self.temp_dir.name) / "settings.json"
+        self.fake_module = FakePyAudioModule()
+        self._orig_pyaudio = audio_share._pyaudio
+        audio_share._pyaudio = lambda: self.fake_module
+        peers = [{"id": "p1", "name": "Laptop", "platform": "windows", "token": TOKEN_A, "host": "192.168.1.10"},
+                 {"id": "p2", "name": "Desk", "platform": "windows", "token": TOKEN_B, "host": "192.168.1.20"}]
+        self.settings_path.write_text(json.dumps({"peers": peers}), encoding="utf-8")
+        self.share = audio_share.AudioShare(self.settings_path)
+        self.host = QWidget()
+        self.panel = audio_page.AudioPanel(self.share, QVBoxLayout(self.host), self.host)
+
+    def tearDown(self):
+        self.panel._timer.stop()
+        self.host.close()
+        audio_share._pyaudio = self._orig_pyaudio
+        self.temp_dir.cleanup()
+
+    def test_it_starts_with_everything_off_and_lists_the_peers_and_devices(self):
+        self.assertFalse(self.panel.send_on.isChecked() or self.panel.receive_on.isChecked())
+        self.assertEqual(self.panel.send_peer.count(), 2)
+        self.assertEqual(self.panel.receive_peer.count(), 3)  # any, then the two peers
+        self.assertEqual(self.panel.send_source.count(), 3)  # default, then the two fake devices
+        self.assertEqual(self.panel.receive_output.count(), 3)
+
+    def test_each_change_is_saved_for_both_sides(self):
+        self.panel.send_on.setChecked(True)
+        self.panel.send_peer.setCurrentIndex(1)
+        self.panel.send_source.setCurrentIndex(2)
+        self.panel.send_source.activated.emit(2)
+        self.panel.receive_on.setChecked(True)
+        self.panel.receive_output.setCurrentIndex(1)
+        self.panel.receive_output.activated.emit(1)
+        saved = audio_share.load_audio(self.settings_path)
+        self.assertEqual(saved["send"], {"on": True, "peer": "p2", "source": "Headphones", "mute_local": False})
+        self.assertEqual(saved["receive"], {"on": True, "peer": "", "output": "Default Speakers"})
+
+    def test_mute_only_applies_to_the_default_speakers(self):
+        self.assertTrue(self.panel.mute.isEnabled())
+        self.panel.send_source.setCurrentIndex(1)
+        self.panel.send_source.activated.emit(1)
+        self.assertFalse(self.panel.mute.isEnabled())
+
+    def test_the_saved_choice_is_shown_again(self):
+        audio_share.save_choice(self.settings_path, {
+            "send": {"on": True, "peer": "p2", "source": "Headphones", "mute_local": False},
+            "receive": {"on": True, "peer": "p1", "output": "Default Speakers"}})
+        self.panel.refresh()
+        self.assertTrue(self.panel.send_on.isChecked() and self.panel.receive_on.isChecked())
+        self.assertEqual(self.panel.send_peer.currentData(), "p2")
+        self.assertEqual(self.panel.send_source.currentData(), "Headphones")
+        self.assertEqual(self.panel.receive_peer.currentData(), "p1")
+
+    def test_the_status_lines_follow_the_share(self):
+        self.share.send_status = "Sending this PC's sound"
+        self.share.receive_status = "Playing sound from Laptop"
+        self.panel._tick()
+        self.assertEqual(self.panel.send_status.text(), "Sending this PC's sound")
+        self.assertEqual(self.panel.receive_status.text(), "Playing sound from Laptop")
+
+    def test_without_a_share_the_page_only_says_it_is_for_windows(self):
+        from PySide6.QtWidgets import QVBoxLayout, QWidget
+        host = QWidget()
+        audio_page.AudioPanel(None, QVBoxLayout(host), host)
 
 
 if __name__ == "__main__":

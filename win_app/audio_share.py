@@ -96,30 +96,44 @@ def settings_dir(settings_path) -> Path:
     return Path(settings_path).parent
 
 
+def _text(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def load_audio(settings_path) -> dict:
-    """The saved choice, forgiving of a missing or damaged file: a machine starts with audio off."""
+    """The saved choice, forgiving of a missing or damaged file: a machine starts with audio off.
+    Sending and playing are separate, so a machine can do both: its own sound to one PC and another
+    PC's sound on a different device."""
     try:
         raw = json.loads((settings_dir(settings_path) / FILE_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-    mode = raw.get("mode")
+    raw = raw if isinstance(raw, dict) else {}
+    send, receive = (raw[k] if isinstance(raw.get(k), dict) else {} for k in ("send", "receive"))
     return {
-        "mode": mode if mode in MODES else "off",
-        "peer": raw["peer"] if isinstance(raw.get("peer"), str) else "",
-        "output": raw["output"] if isinstance(raw.get("output"), str) else "",
-        "mute_local": raw.get("mute_local") is True,
+        "send": {
+            "on": send.get("on") is True, "peer": _text(send.get("peer")), "source": _text(send.get("source")),
+            "mute_local": send.get("mute_local") is True,
+        },
+        "receive": {"on": receive.get("on") is True, "peer": _text(receive.get("peer")), "output": _text(receive.get("output"))},
     }
 
 
-def save_audio(settings_path, mode: str, peer: str = "", output: str = "", mute_local: bool = False) -> None:
-    if mode not in MODES:
-        raise ValueError(mode)
+def save_choice(settings_path, choice: dict) -> None:
     target = settings_dir(settings_path) / FILE_NAME
     temporary = target.with_name(FILE_NAME + ".tmp")
-    temporary.write_text(json.dumps({"mode": mode, "peer": peer, "output": output, "mute_local": bool(mute_local)}), encoding="utf-8")
+    temporary.write_text(json.dumps(choice), encoding="utf-8")
     os.replace(temporary, target)
+
+
+def save_audio(settings_path, mode: str, peer: str = "", output: str = "", mute_local: bool = False) -> None:
+    """Shorthand for one side on and the other off; the window saves both with save_choice."""
+    if mode not in MODES:
+        raise ValueError(mode)
+    save_choice(settings_path, {
+        "send": {"on": mode == "send", "peer": peer if mode == "send" else "", "source": "", "mute_local": bool(mute_local)},
+        "receive": {"on": mode == "receive", "peer": peer if mode == "receive" else "", "output": output},
+    })
 
 
 def paired_peers(settings_path) -> list:
@@ -142,6 +156,10 @@ def paired_peers(settings_path) -> list:
     return peers
 
 
+def _nothing() -> None:
+    pass
+
+
 def _pyaudio():
     import pyaudiowpatch  # imported late: the rest of Beamer works without it
 
@@ -149,7 +167,7 @@ def _pyaudio():
 
 
 def output_devices() -> list:
-    """Names of the speakers this machine can play on, for the choice list."""
+    """Names of the speakers this machine can play on, for the choice lists."""
     pa = _pyaudio()
     player = pa.PyAudio()
     try:
@@ -160,6 +178,25 @@ def output_devices() -> list:
         })
     finally:
         player.terminate()
+
+
+def default_output_name() -> str:
+    pa = _pyaudio()
+    player = pa.PyAudio()
+    try:
+        return player.get_device_info_by_index(player.get_host_api_info_by_type(pa.paWASAPI)["defaultOutputDevice"])["name"]
+    finally:
+        player.terminate()
+
+
+def _loopback_of(player, source: str):
+    """The loopback tap of the named output device, or of the default one when no name is given."""
+    if not source:
+        return player.get_default_wasapi_loopback()
+    for info in player.get_loopback_device_info_generator():
+        if info["name"].startswith(source):
+            return info
+    raise RuntimeError("Sound device not found: " + source)
 
 
 class Player:
@@ -232,16 +269,23 @@ class Player:
 
 
 class AudioShare:
-    """Owns the sending or receiving side the saved mode asks for, and follows changes to it."""
+    """Runs the two sides the saved choice asks for, each on its own, and follows changes to it."""
+
+    SIDES = ("send", "receive")
 
     def __init__(self, settings_path):
         self.settings_path = Path(settings_path)
-        self.status = ""
+        self.send_status = ""
+        self.receive_status = ""
         self._wake = threading.Event()
         self._stopped = threading.Event()
         self._thread = None
-        self._applied = None
-        self._teardown = lambda: None
+        self._applied = {side: None for side in self.SIDES}
+        self._teardowns = {side: _nothing for side in self.SIDES}
+
+    @property
+    def status(self) -> str:
+        return " \u00b7 ".join(text for text in (self.send_status, self.receive_status) if text)
 
     def start(self) -> None:
         if self._thread is None:
@@ -261,51 +305,71 @@ class AudioShare:
     def _run(self) -> None:
         while not self._stopped.is_set():
             self._wake.clear()
-            try:
-                self._reconcile()
-            except Exception as error:
-                LOGGER.exception("Audio sharing failed")
-                self.status = str(error) or error.__class__.__name__
-                self._teardown()
-                self._teardown = lambda: None
-                self._applied = None
+            self._reconcile()
             self._wake.wait(REFRESH_SECONDS)
-        self._teardown()
+        for side in self.SIDES:
+            self._teardowns[side]()
 
     def _reconcile(self) -> None:
         choice = load_audio(self.settings_path)
         peers = paired_peers(self.settings_path)
-        if choice["mode"] == "send":
-            target = next((p for p in peers if p["id"] == choice["peer"] and p["host"]), None)
-            wanted = ("send", target["host"], target["token"], choice["mute_local"]) if target else ("send-missing",)
-        elif choice["mode"] == "receive":
-            wanted = ("receive", choice["peer"], choice["output"], tuple((p["id"], p["token"]) for p in peers))
+        send, receive = choice["send"], choice["receive"]
+        try:
+            # Playing on the device whose sound is sent would send it straight back: an echo for ever.
+            clash = send["on"] and receive["on"] and (
+                send["source"] or default_output_name()) == (receive["output"] or default_output_name())
+        except Exception:
+            clash = False
+        target = next((p for p in peers if p["id"] == send["peer"] and p["host"]), None)
+        if not send["on"]:
+            wanted_send = ("off",)
+        elif clash:
+            wanted_send = ("clash",)
+        elif target is None:
+            wanted_send = ("send-missing",)
         else:
-            wanted = ("off",)
-        if wanted == self._applied:
-            return
-        self._teardown()
-        self._teardown = lambda: None
-        self._applied = wanted
-        if wanted[0] == "off":
-            self.status = ""
-        elif wanted[0] == "send-missing":
-            self.status = "Choose a paired machine to send to"
-        elif wanted[0] == "send":
-            self._teardown = self._start_sending(wanted[1], wanted[2], wanted[3])
-            self.status = "Sending this PC's sound"
-        else:
-            self._teardown = self._start_receiving(choice["peer"], choice["output"], peers)
-            self.status = "Waiting for sound"
+            wanted_send = ("send", target["host"], target["token"], send["mute_local"] and not send["source"], send["source"])
+        wanted_receive = (
+            ("receive", receive["peer"], receive["output"], tuple((p["id"], p["token"]) for p in peers))
+            if receive["on"] else ("off",))
+        for side, wanted in (("send", wanted_send), ("receive", wanted_receive)):
+            try:
+                self._apply_side(side, wanted, peers)
+            except Exception as error:
+                LOGGER.exception("Audio %s failed", side)
+                setattr(self, side + "_status", str(error) or error.__class__.__name__)
+                self._teardowns[side]()
+                self._teardowns[side] = _nothing
+                self._applied[side] = None
 
-    def _start_sending(self, host: str, token: str, mute_local: bool = False):
+    def _apply_side(self, side: str, wanted: tuple, peers: list) -> None:
+        if wanted == self._applied[side]:
+            return
+        self._teardowns[side]()
+        self._teardowns[side] = _nothing
+        self._applied[side] = wanted
+        status = ""
+        kind = wanted[0]
+        if kind == "send-missing":
+            status = "Choose a paired machine to send to"
+        elif kind == "clash":
+            status = "Send and play on different devices, or the sound loops back"
+        elif kind == "send":
+            self._teardowns[side] = self._start_sending(*wanted[1:])
+            status = "Sending this PC's sound"
+        elif kind == "receive":
+            self._teardowns[side] = self._start_receiving(wanted[1], wanted[2], peers)
+            status = "Waiting for sound"
+        setattr(self, side + "_status", status)
+
+    def _start_sending(self, host: str, token: str, mute_local: bool = False, source: str = ""):
         pa = _pyaudio()
         player = pa.PyAudio()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         session = struct.unpack(">I", random_bytes(4))[0]
         sequence = [0]
         try:
-            loopback = player.get_default_wasapi_loopback()
+            loopback = _loopback_of(player, source)
             rate, channels = int(loopback["defaultSampleRate"]), int(loopback["maxInputChannels"])
 
             def push(data, _frames, _time_info, _status):
@@ -364,7 +428,7 @@ class AudioShare:
                         if player is not None and time.monotonic() - source[3] > IDLE_SECONDS:
                             player.close()
                             player = source = None
-                            self.status = "Waiting for sound"
+                            self.receive_status = "Waiting for sound"
                         continue
                     except OSError as error:
                         if stop.is_set() or getattr(error, "winerror", 0) not in (10040, 10054):
@@ -385,12 +449,12 @@ class AudioShare:
                             player.close()
                             player = None
                         player = Player(pa, rate, output)
-                    self.status = "Playing sound from " + peer["name"]
+                    self.receive_status = "Playing sound from " + peer["name"]
                     source = (peer["id"], session, sequence, now)
                     player.feed(pcm)
             except Exception as error:
                 LOGGER.exception("Audio playback failed")
-                self.status = "Could not play sound: " + (str(error) or error.__class__.__name__)
+                self.receive_status = "Could not play sound: " + (str(error) or error.__class__.__name__)
             finally:
                 if player is not None:
                     player.close()

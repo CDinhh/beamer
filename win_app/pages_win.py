@@ -25,6 +25,8 @@ PAGES = (
     ("keyboard", N_("Keyboard"),
      N_("How this PC's Ctrl and Windows keys arrive on another machine, the keys and buttons that stay "
      "here, and how fast another machine's pointer moves here.")),
+    ("audio", N_("Audio"),
+     N_("Send this PC's sound to another PC and play another PC's sound here, both ways at once.")),
     ("design", N_("Design"),
      N_("How crossing looks on this PC: the light as you push toward another machine, and where the "
      "pointer lands.")),

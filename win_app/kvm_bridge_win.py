@@ -52,7 +52,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import app_config
 import audio_share
-from audio_dialog import AudioDialog
+from audio_page import AudioPanel
 from app_config import (
     Config,
     ConfigError,
@@ -881,6 +881,7 @@ class WindowsApplication(QWidget):
             "overview": self._overview_page,
             "crossing": self._crossing_page,
             "design": self._design_page,
+            "audio": self._audio_page,
             "keyboard": self._keyboard_page,
             "connection": self._connection_page,
         }
@@ -952,6 +953,9 @@ class WindowsApplication(QWidget):
             self.trigger_recorder.cancel()
             self.crossing_ledger.cancel_recording()
         self._run_previews()
+
+    def _audio_page(self, layout, current) -> None:
+        self.audio_panel = AudioPanel(self.audio, layout, self)
 
     # -- Overview ---------------------------------------------------------------------------
 
@@ -4996,8 +5000,6 @@ class WindowsApplication(QWidget):
         menu.addSeparator()
         self.open_action = menu.addAction(tr("Settings…"))
         self.open_action.triggered.connect(lambda _checked=False: self.show_window())
-        if self.audio is not None:
-            menu.addAction(tr("Audio sharing…")).triggered.connect(self.show_audio)
         menu.addAction(tr("Reload configuration")).triggered.connect(self.reload_config)
         menu.addAction(tr("Open log folder")).triggered.connect(self.open_log_folder)
         menu.addSeparator()
@@ -5124,9 +5126,6 @@ class WindowsApplication(QWidget):
     def _on_tray_activated(self, reason) -> None:
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
             self.show_window()
-
-    def show_audio(self) -> None:
-        AudioDialog(self.audio).exec()
 
     def start(self) -> None:
         self.update_checker.start()
