@@ -106,9 +106,9 @@ function Get-Service { param($Name, $ErrorAction) return $null }
 function Restart-Service { param($Name, [switch]$Force, $ErrorAction) $script:restarted += $Name }
 Repair-BeamerFirewall -ExePath 'C:\A & B\Beamer.exe'
 Repair-BeamerGameInput
-if ($script:rules.Count -ne 3) { throw 'Expected exactly three firewall rules' }
+if ($script:rules.Count -ne 4) { throw 'Expected exactly four firewall rules' }
 if (@($script:rules | Where-Object { $_.Profile -ne 'Private' -or $_.Program -ne 'C:\A & B\Beamer.exe' }).Count) { throw 'Rule scope broadened' }
-if (($script:rules | ForEach-Object { "$($_.Protocol):$($_.Port)" }) -join ',' -ne 'TCP:24820,UDP:24821,TCP:24821') { throw 'Unexpected ports or protocols' }
+if (($script:rules | ForEach-Object { "$($_.Protocol):$($_.Port)" }) -join ',' -ne 'TCP:24820,UDP:24821,TCP:24821,UDP:24822') { throw 'Unexpected ports or protocols' }
 if ($script:restarted.Count) { throw 'Restarted absent GameInput service' }
 function Get-Service { param($Name, $ErrorAction) return [pscustomobject]@{ Name='GameInputSvc' } }
 Repair-BeamerGameInput
@@ -135,7 +135,7 @@ function Remove-NetFirewallRule { param([Parameter(ValueFromPipeline=$true)]$Inp
 Update-BeamerAutostart -ExePath 'C:\Beamer\Beamer.exe' -UserSid 'S-1-5-21-123' -Remove
 Remove-BeamerFirewall -ExePath 'C:\Beamer\Beamer.exe'
 if ($script:removedTasks.Count -ne 1 -or $script:removedTasks[0] -ne 'Beamer') { throw 'Matching task was not removed' }
-if ($script:removedRules.Count -ne 3 -or @($script:removedRules | Where-Object { $_ -ne 'ours' }).Count) { throw 'Removed another install firewall rule' }
+if ($script:removedRules.Count -ne 4 -or @($script:removedRules | Where-Object { $_ -ne 'ours' }).Count) { throw 'Removed another install firewall rule' }
 ''')
 
 

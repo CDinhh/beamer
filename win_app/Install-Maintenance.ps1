@@ -44,7 +44,7 @@ function Update-BeamerAutostart([string]$ExePath, [string]$UserSid, [switch]$Rem
 }
 
 function Remove-BeamerFirewall([string]$ExePath) {
-    foreach ($name in @('Beamer Receiver (TCP-In)', 'Beamer Pairing (UDP-In)', 'Beamer Pairing (TCP-In)')) {
+    foreach ($name in @('Beamer Receiver (TCP-In)', 'Beamer Pairing (UDP-In)', 'Beamer Pairing (TCP-In)', 'Beamer Audio (UDP-In)')) {
         foreach ($rule in @(Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
             $filter = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop
             if ([string]::Equals($filter.Program, $ExePath, [StringComparison]::OrdinalIgnoreCase)) {
@@ -59,7 +59,8 @@ function Repair-BeamerFirewall([string]$ExePath) {
     $rules = @(
         @{ Name = 'Beamer Receiver (TCP-In)'; Protocol = 'TCP'; Port = 24820 },
         @{ Name = 'Beamer Pairing (UDP-In)'; Protocol = 'UDP'; Port = 24821 },
-        @{ Name = 'Beamer Pairing (TCP-In)'; Protocol = 'TCP'; Port = 24821 }
+        @{ Name = 'Beamer Pairing (TCP-In)'; Protocol = 'TCP'; Port = 24821 },
+        @{ Name = 'Beamer Audio (UDP-In)'; Protocol = 'UDP'; Port = 24822 }
     )
     foreach ($rule in $rules) {
         New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound -Protocol $rule.Protocol -LocalPort $rule.Port -Action Allow -Profile Private -Program $ExePath -ErrorAction Stop | Out-Null

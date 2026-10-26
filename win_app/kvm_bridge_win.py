@@ -51,6 +51,8 @@ from PySide6.QtWidgets import (
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import app_config
+import audio_share
+from audio_dialog import AudioDialog
 from app_config import (
     Config,
     ConfigError,
@@ -789,6 +791,7 @@ class WindowsApplication(QWidget):
         self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.preview_loop = PreviewLoop(self)
         self.tile_hover = TileHover(self.preview_loop, self)
+        self.audio = audio_share.AudioShare(self.config_path) if sys.platform == "win32" else None
         self._build_window()
         self._apply_theme()
         self._build_tray()
@@ -4993,6 +4996,8 @@ class WindowsApplication(QWidget):
         menu.addSeparator()
         self.open_action = menu.addAction(tr("Settings…"))
         self.open_action.triggered.connect(lambda _checked=False: self.show_window())
+        if self.audio is not None:
+            menu.addAction(tr("Audio sharing…")).triggered.connect(self.show_audio)
         menu.addAction(tr("Reload configuration")).triggered.connect(self.reload_config)
         menu.addAction(tr("Open log folder")).triggered.connect(self.open_log_folder)
         menu.addSeparator()
@@ -5120,8 +5125,13 @@ class WindowsApplication(QWidget):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
             self.show_window()
 
+    def show_audio(self) -> None:
+        AudioDialog(self.audio).exec()
+
     def start(self) -> None:
         self.update_checker.start()
+        if self.audio is not None:
+            self.audio.start()
         self._listen()
 
     def _listen(self) -> None:
@@ -5445,6 +5455,8 @@ class WindowsApplication(QWidget):
         if self._closing:
             return
         self._closing = True
+        if self.audio is not None:
+            self.audio.stop()
         self.identify_screens.stop()
         self.refresh_timer.stop()
         self.update_checker.stop()
